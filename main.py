@@ -7,39 +7,47 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
+import keyring
 import pdfplumber
 from anthropic import (Anthropic, APIConnectionError, AuthenticationError,
                        RateLimitError)
 from docx import Document
-from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QPalette, QTextCursor
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
-                             QFileDialog, QFormLayout, QFrame, QGridLayout,
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import (QApplication, QFileDialog, QFormLayout,
                              QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                              QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMessageBox, QProgressBar,
-                             QPushButton, QScrollArea, QSplitter, QTableWidget,
-                             QTableWidgetItem, QTabWidget, QTextEdit,
-                             QVBoxLayout, QWidget)
+                             QPushButton, QTableWidget, QTableWidgetItem,
+                             QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 MODEL_NAME = "claude-sonnet-4-5"
-MAX_TOKENS = 8000
+MAX_TOKENS_UNIFIED = 3000
+DEBUG_CV = True
+MAX_TOKENS_PROFILE = 8000
 CONFIG_FILE = "config.json"
 PROFILE_FILE = "master_profile.json"
 DEFAULT_OUTPUT = "output"
+KEYRING_SERVICE = "cv-tailor"
+KEYRING_USER = "anthropic-api-key"
 COMPANY_MAX = 25
 TITLE_MAX = 35
 BULK_DELAY_SEC = 1.0
 RATE_LIMIT_RETRY_SEC = 5
+
+PAGE_W_CM = 21.0
+PAGE_H_CM = 29.7
+MARGIN_CM = 2.0
+RIGHT_TAB_CM = PAGE_W_CM - 2 * MARGIN_CM  # 17cm — dynamic right-edge tab
 
 BG = "#0d1117"
 FG = "#e6edf3"
@@ -71,25 +79,64 @@ SKILL_CATEGORIES = [
 
 # ─── Config / IO helpers ─────────────────────────────────────────────────
 
-def load_config():
-    """Return config dict (creates defaults if missing)."""
-    if not os.path.exists(CONFIG_FILE):
-        return {"api_key": "", "output_folder": DEFAULT_OUTPUT}
+def _get_api_key_from_keyring():
+    """Read the API key from the OS keyring. Returns '' on any failure."""
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return keyring.get_password(KEYRING_SERVICE, KEYRING_USER) or ""
     except Exception:
-        return {"api_key": "", "output_folder": DEFAULT_OUTPUT}
+        return ""
+
+
+def _set_api_key_in_keyring(key):
+    """Store (or delete if empty) the API key in the OS keyring."""
+    try:
+        if key:
+            keyring.set_password(KEYRING_SERVICE, KEYRING_USER, key)
+        else:
+            try:
+                keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def load_config():
+    """Return config dict. API key comes from OS keyring; if a legacy
+    plaintext key is found in config.json it is migrated to the keyring
+    and scrubbed from disk."""
+    cfg = {"api_key": "", "output_folder": DEFAULT_OUTPUT}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            cfg["output_folder"] = disk.get("output_folder") or DEFAULT_OUTPUT
+            legacy_key = (disk.get("api_key") or "").strip()
+            if legacy_key:
+                _set_api_key_in_keyring(legacy_key)
+                # Scrub plaintext key from disk
+                try:
+                    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                        json.dump({"output_folder": cfg["output_folder"]},
+                                  f, indent=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    cfg["api_key"] = _get_api_key_from_keyring()
+    return cfg
 
 
 def save_config(cfg):
-    """Write config dict to disk."""
+    """Persist non-secret config to disk; persist API key to OS keyring."""
+    _set_api_key_in_keyring((cfg.get("api_key") or "").strip())
+    on_disk = {"output_folder": cfg.get("output_folder") or DEFAULT_OUTPUT}
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+        json.dump(on_disk, f, indent=2)
 
 
 def load_profile():
-    """Return master profile dict, or empty schema if none."""
+    """Return master profile dict, or None if missing/corrupt."""
     if not os.path.exists(PROFILE_FILE):
         return None
     try:
@@ -124,9 +171,14 @@ def extract_text_from_file(path):
 
 
 def sanitize_filename_part(text, maxlen):
-    """Turn text into safe filename segment."""
+    """Turn text into safe filename segment, transliterating non-ASCII."""
+    if not text:
+        return "Unknown"
+    text = unicodedata.normalize("NFKD", text)
+    text = text.encode("ascii", "ignore").decode("ascii")
     text = text.strip().replace(" ", "_")
     text = re.sub(r"[^A-Za-z0-9_\-]", "", text)
+    text = re.sub(r"_+", "_", text).strip("_")
     return text[:maxlen] or "Unknown"
 
 
@@ -144,25 +196,186 @@ def build_output_path(output_folder, company, title):
     return path
 
 
-def parse_json_response(text):
-    """Extract JSON object from Claude response, stripping fences if any."""
-    text = text.strip()
+def trim_profile(profile):
+    """Drop empty values so we don't pay tokens for blank keys."""
+    if not profile:
+        return {}
+    out = {}
+    for k, v in profile.items():
+        if v in (None, "", [], {}):
+            continue
+        if isinstance(v, dict):
+            sub = {sk: sv for sk, sv in v.items() if sv not in (None, "", [])}
+            if sub:
+                out[k] = sub
+        elif isinstance(v, list):
+            cleaned = [x for x in v if x not in (None, "", [], {})]
+            if cleaned:
+                out[k] = cleaned
+        else:
+            out[k] = v
+    return out
+
+
+_FIELD_SHORTS = {
+    "achievements": "ach", "responsibilities": "resp",
+    "organization": "org", "description": "desc",
+    "technologies": "tech", "highlights": "pts",
+}
+
+
+def compress_profile(profile):
+    """Trim empty fields then shorten common key names to save input tokens."""
+    trimmed = trim_profile(profile)
+    text = json.dumps(trimmed, separators=(",", ":"))
+    for long, short in _FIELD_SHORTS.items():
+        text = text.replace(f'"{long}":', f'"{short}":')
+    return text
+
+
+def validate_cv_output(cv_data, master_profile):
+    """Strip any skill or achievement not present in the master profile."""
+    real_skills = set()
+    for cat_skills in master_profile.get("skills", {}).values():
+        if isinstance(cat_skills, list):
+            for s in cat_skills:
+                real_skills.add(s.lower().strip())
+    for cat, skills in cv_data.get("skills", {}).items():
+        if isinstance(skills, list):
+            cv_data["skills"][cat] = [
+                s for s in skills if s.lower().strip() in real_skills
+            ]
+    real_ach = {a.lower().strip()
+                for a in master_profile.get("achievements", [])}
+    if real_ach:
+        cv_data["achievements"] = [
+            a for a in cv_data.get("achievements", [])
+            if a.lower().strip() in real_ach
+        ]
+    return cv_data
+
+
+def strip_hard_gap(text):
+    """Split a response into (body_without_hard_gap, hard_gap_string)."""
+    m = re.search(r"(?im)^\s*HARD_GAP\s*:\s*(.+?)\s*$", text)
+    if not m:
+        return text, ""
+    return text[:m.start()] + text[m.end():], m.group(1).strip()
+
+
+def parse_json_response(raw_text):
+    """Extract a JSON object from Claude output robustly."""
+    text = raw_text.strip()
+    # Strip markdown fences
     if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
+        lines = text.split("\n")
+        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    text = re.sub(r"```[a-zA-Z]*\n?", "", text).replace("```", "")
+
+    # Direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Boundary extraction: first { to last }
     start = text.find("{")
     end = text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("No JSON object found")
-    return json.loads(text[start:end + 1])
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Log details for diagnosis
+    print(f"[ERROR] Failed to parse Claude response")
+    print(f"[ERROR] Response length: {len(raw_text)} chars")
+    print(f"[ERROR] First 500 chars: {raw_text[:500]}")
+    print(f"[ERROR] Last 200 chars: {raw_text[-200:]}")
+    raise ValueError(
+        f"Could not parse Claude response as JSON. "
+        f"Response length: {len(raw_text)} chars."
+    )
 
 
 def open_file_native(path):
-    """Open a file with OS default application."""
+    """Open a file with the OS default application (Windows-first)."""
     try:
-        os.startfile(path)
+        os.startfile(os.path.abspath(path))
     except Exception:
-        subprocess.Popen(["cmd", "/c", "start", "", path], shell=False)
+        subprocess.Popen(["cmd", "/c", "start", "", os.path.abspath(path)],
+                         shell=False)
+
+
+def safe_merge_profiles(old, new):
+    """Guard against Claude dropping data: keep any old list items missing
+    from new (by name/title key)."""
+    if not old:
+        return new
+    if not new:
+        return old
+    out = dict(new)
+    for list_key, id_key in (("experience", "title"), ("projects", "name"),
+                             ("education", "degree"),
+                             ("certifications", "name"),
+                             ("volunteering", "role")):
+        old_list = old.get(list_key) or []
+        new_list = out.get(list_key) or []
+        seen = {(it.get(id_key) or "").strip().lower() for it in new_list}
+        for it in old_list:
+            key = (it.get(id_key) or "").strip().lower()
+            if key and key not in seen:
+                new_list.append(it)
+                seen.add(key)
+        out[list_key] = new_list
+    # Union skill lists
+    old_sk = old.get("skills") or {}
+    new_sk = out.get("skills") or {}
+    merged_sk = {}
+    for k in set(list(old_sk.keys()) + list(new_sk.keys())):
+        merged = list(new_sk.get(k) or [])
+        lower = {s.lower() for s in merged}
+        for s in old_sk.get(k) or []:
+            if s.lower() not in lower:
+                merged.append(s)
+                lower.add(s.lower())
+        merged_sk[k] = merged
+    if merged_sk:
+        out["skills"] = merged_sk
+    # Preserve contact fields that got blanked
+    old_c = old.get("contact") or {}
+    new_c = out.get("contact") or {}
+    for k, v in old_c.items():
+        if v and not new_c.get(k):
+            new_c[k] = v
+    if new_c:
+        out["contact"] = new_c
+    if old.get("name") and not out.get("name"):
+        out["name"] = old["name"]
+    return out
+
+
+# ─── Claude call wrapper with parse-retry + rate-limit retry ─────────────
+
+def claude_call(client, system, user, max_tokens, retries=1):
+    """Call Anthropic once, retrying on RateLimit once. Returns raw text."""
+    last_err = None
+    for _ in range(retries + 2):
+        try:
+            msg = client.messages.create(
+                model=MODEL_NAME, max_tokens=max_tokens, system=system,
+                messages=[{"role": "user", "content": user}])
+            text = msg.content[0].text
+            if DEBUG_CV:
+                usage = msg.usage
+                print(f"[DEBUG] in={usage.input_tokens} out={usage.output_tokens} "
+                      f"chars={len(text)} preview={text[:200]!r}")
+            return text
+        except RateLimitError as e:
+            last_err = e
+            time.sleep(RATE_LIMIT_RETRY_SEC)
+            continue
+    raise last_err
 
 
 # ─── ProfileManager ──────────────────────────────────────────────────────
@@ -177,36 +390,49 @@ class ProfileManager:
     def build_new(self, texts):
         """Create a fresh profile from extracted document texts."""
         combined = "\n\n---\n\n".join(texts)
-        schema_str = json.dumps(PROFILE_SCHEMA, indent=2)
+        schema_str = json.dumps(PROFILE_SCHEMA, separators=(",", ":"))
         system = (
-            "Extract ALL information from these CV documents and return "
-            "a single unified master profile as JSON matching the exact "
-            "schema provided. Return ONLY valid JSON, no markdown fences, "
-            "no commentary.\n\nSCHEMA:\n" + schema_str
+            "Extract ONLY the information explicitly present in the CV "
+            "document(s) into this exact JSON schema. Return ONLY valid "
+            "JSON, no fences, no commentary.\n\n"
+            "STRICT EXTRACTION RULES:\n"
+            "- Copy text verbatim where possible; minor rewording only.\n"
+            "- NEVER invent metrics, numbers, percentages, dates, awards, "
+            "projects, skills, languages, or achievements not stated in "
+            "the source documents.\n"
+            "- If a field is not in the source, leave it empty.\n"
+            "- Experience entries use keys: title, company, location, "
+            "start_date, end_date, responsibilities (list of bullets).\n"
+            "- Project entries use keys: name, description, technologies "
+            "(list), link, highlights (list of bullets).\n"
+            "- Volunteering entries use keys: role, organization, "
+            "start_date, end_date, description.\n"
+            "- Education entries use keys: degree, institution, location, "
+            "start_date, end_date, details.\n"
+            "- Skills must use the category keys in the schema exactly.\n\n"
+            "SCHEMA: " + schema_str
         )
-        msg = self.client.messages.create(
-            model=MODEL_NAME, max_tokens=MAX_TOKENS, system=system,
-            messages=[{"role": "user", "content": combined}],
-        )
-        return parse_json_response(msg.content[0].text)
+        text = claude_call(self.client, system, combined, MAX_TOKENS_PROFILE)
+        return parse_json_response(text)
 
     def merge(self, existing, texts):
         """Merge new document texts into existing profile."""
         combined = "\n\n---\n\n".join(texts)
+        compact = json.dumps(existing, separators=(",", ":"))
         system = (
-            "Merge new CV information into the existing master profile. "
-            "Add new roles, projects, skills. Deduplicate — never add "
-            "something already present. Never remove existing data. "
-            "Return the complete updated profile as JSON. Return ONLY "
-            "valid JSON."
+            "Merge new CV information into the existing profile. Add new "
+            "roles, projects, skills found in the source documents. "
+            "Deduplicate. NEVER remove existing data. NEVER invent "
+            "content not present in either the existing profile or the "
+            "new documents (no fabricated metrics, awards, projects, "
+            "skills, or achievements). Use the same schema keys as the "
+            "existing profile. Return the complete updated profile as "
+            "JSON only, no fences."
         )
-        user = (f"EXISTING PROFILE:\n{json.dumps(existing, indent=2)}"
-                f"\n\nNEW DOCUMENTS:\n{combined}")
-        msg = self.client.messages.create(
-            model=MODEL_NAME, max_tokens=MAX_TOKENS, system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        return parse_json_response(msg.content[0].text)
+        user = f"EXISTING:{compact}\n\nNEW:\n{combined}"
+        text = claude_call(self.client, system, user, MAX_TOKENS_PROFILE)
+        merged = parse_json_response(text)
+        return safe_merge_profiles(existing, merged)
 
 
 # ─── DocxBuilder ─────────────────────────────────────────────────────────
@@ -216,9 +442,8 @@ class DocxBuilder:
 
     @staticmethod
     def _set_bottom_border(paragraph):
-        """Add a bottom border to a paragraph (used for section headers)."""
-        p = paragraph._p
-        pPr = p.get_or_add_pPr()
+        """Add a single-line bottom border to a paragraph."""
+        pPr = paragraph._p.get_or_add_pPr()
         pBdr = OxmlElement("w:pBdr")
         bottom = OxmlElement("w:bottom")
         bottom.set(qn("w:val"), "single")
@@ -229,11 +454,46 @@ class DocxBuilder:
         pPr.append(pBdr)
 
     @staticmethod
+    def _clear_table_borders(table):
+        """Force all borders off (top/left/bottom/right/insideH/insideV)."""
+        tbl = table._tbl
+        tblPr = tbl.tblPr
+        existing = tblPr.find(qn("w:tblBorders"))
+        if existing is not None:
+            tblPr.remove(existing)
+        borders = OxmlElement("w:tblBorders")
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            el = OxmlElement(f"w:{edge}")
+            el.set(qn("w:val"), "nil")
+            borders.append(el)
+        tblPr.append(borders)
+
+    @staticmethod
+    def _set_cell_width(cell, cm):
+        """Set a fixed cell width in OXML (python-docx cell.width is lossy)."""
+        tcPr = cell._tc.get_or_add_tcPr()
+        tcW = tcPr.find(qn("w:tcW"))
+        if tcW is None:
+            tcW = OxmlElement("w:tcW")
+            tcPr.append(tcW)
+        tcW.set(qn("w:w"), str(int(cm * 567)))  # 567 twips per cm
+        tcW.set(qn("w:type"), "dxa")
+
+    @staticmethod
     def _add_run(paragraph, text, *, bold=False, italic=False,
                  size=10.5, color=None, font="Calibri"):
         """Append a styled run to a paragraph."""
         run = paragraph.add_run(text)
         run.font.name = font
+        # Needed for East-Asian fallback to also use Calibri in Word
+        rPr = run._r.get_or_add_rPr()
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rPr.append(rFonts)
+        rFonts.set(qn("w:ascii"), font)
+        rFonts.set(qn("w:hAnsi"), font)
+        rFonts.set(qn("w:cs"), font)
         run.font.size = Pt(size)
         run.bold = bold
         run.italic = italic
@@ -242,15 +502,31 @@ class DocxBuilder:
         return run
 
     @staticmethod
+    def _set_defaults(doc):
+        """Set document default font to Calibri 10.5 so styles inherit."""
+        styles = doc.styles
+        normal = styles["Normal"]
+        normal.font.name = "Calibri"
+        normal.font.size = Pt(10.5)
+        rPr = normal.element.get_or_add_rPr()
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rPr.insert(0, rFonts)
+        rFonts.set(qn("w:ascii"), "Calibri")
+        rFonts.set(qn("w:hAnsi"), "Calibri")
+        rFonts.set(qn("w:cs"), "Calibri")
+
+    @staticmethod
     def _set_page(doc):
         """Set A4, 2cm margins."""
         for section in doc.sections:
-            section.page_width = Cm(21.0)
-            section.page_height = Cm(29.7)
-            section.left_margin = Cm(2)
-            section.right_margin = Cm(2)
-            section.top_margin = Cm(2)
-            section.bottom_margin = Cm(2)
+            section.page_width = Cm(PAGE_W_CM)
+            section.page_height = Cm(PAGE_H_CM)
+            section.left_margin = Cm(MARGIN_CM)
+            section.right_margin = Cm(MARGIN_CM)
+            section.top_margin = Cm(MARGIN_CM)
+            section.bottom_margin = Cm(MARGIN_CM)
 
     @classmethod
     def _section_header(cls, doc, text):
@@ -265,10 +541,10 @@ class DocxBuilder:
 
     @classmethod
     def _title_with_date(cls, doc, title, date_str, italic_title=False):
-        """Add bold title left + date right with tab stop at 16cm."""
+        """Bold title left, date right, right-tab at (page − margins)."""
         p = doc.add_paragraph()
         p.paragraph_format.tab_stops.add_tab_stop(
-            Cm(16), WD_TAB_ALIGNMENT.RIGHT)
+            Cm(RIGHT_TAB_CM), WD_TAB_ALIGNMENT.RIGHT)
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
         cls._add_run(p, title, bold=True, italic=italic_title, size=11)
@@ -279,7 +555,7 @@ class DocxBuilder:
 
     @classmethod
     def _subline(cls, doc, text, *, italic=True, color="444444"):
-        """Add an italic subline (company / tech stack)."""
+        """Italic subline (company / tech stack)."""
         p = doc.add_paragraph()
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(2)
@@ -288,28 +564,55 @@ class DocxBuilder:
 
     @classmethod
     def _bullets(cls, doc, items):
-        """Add a bullet list using ListBullet style."""
+        """Add bullet list using Word's List Bullet style."""
+        added = False
         for b in items:
             if not b:
                 continue
             p = doc.add_paragraph(style="List Bullet")
             p.paragraph_format.space_before = Pt(0)
             p.paragraph_format.space_after = Pt(2)
-            p.paragraph_format.left_indent = Cm(0.5)
-            p.paragraph_format.first_line_indent = Cm(-0.5)
-            for r in p.runs:
-                r.font.name = "Calibri"
-                r.font.size = Pt(10.5)
-            if not p.runs:
-                cls._add_run(p, b, size=10.5)
-            else:
-                p.runs[0].text = b
-        if items:
+            cls._add_run(p, b, size=10.5)
+            added = True
+        if added:
             doc.paragraphs[-1].paragraph_format.space_after = Pt(6)
+
+    @staticmethod
+    def _add_hyperlink(paragraph, text, url):
+        """Append a blue underlined clickable hyperlink run to a paragraph."""
+        r_id = paragraph.part.relate_to(
+            url,
+            "http://schemas.openxmlformats.org/officeDocument/2006/"
+            "relationships/hyperlink",
+            is_external=True,
+        )
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("r:id"), r_id)
+        run = OxmlElement("w:r")
+        rPr = OxmlElement("w:rPr")
+        color_el = OxmlElement("w:color")
+        color_el.set(qn("w:val"), "1155CC")
+        rPr.append(color_el)
+        u = OxmlElement("w:u")
+        u.set(qn("w:val"), "single")
+        rPr.append(u)
+        fonts = OxmlElement("w:rFonts")
+        fonts.set(qn("w:ascii"), "Calibri")
+        fonts.set(qn("w:hAnsi"), "Calibri")
+        rPr.append(fonts)
+        sz = OxmlElement("w:sz")
+        sz.set(qn("w:val"), "20")  # 10pt = 20 half-points
+        rPr.append(sz)
+        run.append(rPr)
+        t = OxmlElement("w:t")
+        t.text = text
+        run.append(t)
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
 
     @classmethod
     def _header_block(cls, doc, profile):
-        """Name + contact line + hr."""
+        """Name + contact line (with clickable links) + hr."""
         name = profile.get("name", "") or ""
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -318,14 +621,45 @@ class DocxBuilder:
         cls._add_run(p, name, bold=True, size=18)
 
         contact = profile.get("contact", {}) or {}
-        parts = [contact.get(k, "") for k in
-                 ("email", "phone", "linkedin", "github", "website")]
-        parts = [p for p in parts if p]
         p2 = doc.add_paragraph()
         p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p2.paragraph_format.space_before = Pt(0)
         p2.paragraph_format.space_after = Pt(0)
-        cls._add_run(p2, " | ".join(parts), size=10, color="555555")
+
+        def _plain(text):
+            r = p2.add_run(text)
+            r.font.name = "Calibri"
+            r.font.size = Pt(10)
+            r.font.color.rgb = RGBColor(0x55, 0x55, 0x55)
+
+        def _sep():
+            _plain(" | ")
+
+        plain_fields = [
+            contact.get("email", ""),
+            contact.get("phone", ""),
+        ]
+        link_fields = {
+            "linkedin": contact.get("linkedin", ""),
+            "github":   contact.get("github", ""),
+            "website":  contact.get("website", ""),
+        }
+
+        # Emit non-empty plain fields first
+        parts_plain = [f for f in plain_fields if f]
+        for i, val in enumerate(parts_plain):
+            _plain(val)
+            if i < len(parts_plain) - 1 or any(link_fields.values()):
+                _sep()
+
+        # Emit link fields as proper hyperlinks
+        link_items = [(v, v) for v in link_fields.values() if v]
+        for i, (display, raw_url) in enumerate(link_items):
+            url = raw_url if raw_url.startswith("http") else f"https://{raw_url}"
+            cls._add_hyperlink(p2, display, url)
+            if i < len(link_items) - 1:
+                _sep()
+
         cls._set_bottom_border(p2)
         spacer = doc.add_paragraph()
         spacer.paragraph_format.space_before = Pt(0)
@@ -341,11 +675,20 @@ class DocxBuilder:
             return
         table = doc.add_table(rows=len(rows), cols=2)
         table.autofit = False
+        cls._clear_table_borders(table)
+        # Force fixed table layout
+        tblPr = table._tbl.tblPr
+        layout = OxmlElement("w:tblLayout")
+        layout.set(qn("w:type"), "fixed")
+        tblPr.append(layout)
+
+        left_w = 3.5
+        right_w = PAGE_W_CM - 2 * MARGIN_CM - left_w
         for row_i, (label, values) in enumerate(rows):
             left = table.cell(row_i, 0)
             right = table.cell(row_i, 1)
-            left.width = Cm(3.5)
-            right.width = Cm(13.5)
+            cls._set_cell_width(left, left_w)
+            cls._set_cell_width(right, right_w)
             lp = left.paragraphs[0]
             lp.paragraph_format.space_before = Pt(1)
             lp.paragraph_format.space_after = Pt(1)
@@ -355,18 +698,26 @@ class DocxBuilder:
             rp.paragraph_format.space_after = Pt(1)
             cls._add_run(rp, ", ".join(values), size=10.5)
 
+    @staticmethod
+    def _remove_compat_mode(doc):
+        """Strip the w:compat block so Word opens in edit mode, not compat mode."""
+        settings = doc.settings.element
+        compat = settings.find(qn("w:compat"))
+        if compat is not None:
+            settings.remove(compat)
+        doc.core_properties.revision = 1
+
     @classmethod
     def build(cls, profile, cv_data, output_path):
         """Build the full CV document."""
         doc = Document()
+        cls._remove_compat_mode(doc)
+        cls._set_defaults(doc)
         cls._set_page(doc)
 
-        merged = {**profile, **{k: v for k, v in cv_data.items() if v}}
-        merged["name"] = profile.get("name", "") or cv_data.get("name", "")
-        merged["contact"] = profile.get("contact", {}) or \
-            cv_data.get("contact", {})
-
-        cls._header_block(doc, merged)
+        name = cv_data.get("name") or profile.get("name", "")
+        contact = cv_data.get("contact") or profile.get("contact", {})
+        cls._header_block(doc, {"name": name, "contact": contact})
 
         summary = cv_data.get("summary") or profile.get("summary")
         if summary:
@@ -379,30 +730,56 @@ class DocxBuilder:
         if experience:
             cls._section_header(doc, "Experience")
             for role in experience:
-                dates = cls._fmt_dates(role.get("start"), role.get("end"),
-                                       role.get("current"))
+                dates = cls._fmt_range(
+                    role.get("start_date") or role.get("start"),
+                    role.get("end_date") or role.get("end"),
+                    role.get("current"))
                 cls._title_with_date(doc, role.get("title", ""), dates)
                 comp = role.get("company", "")
                 loc = role.get("location", "")
                 sub = comp + (f" — {loc}" if loc else "")
                 if sub.strip():
                     cls._subline(doc, sub)
-                cls._bullets(doc, role.get("achievements", []))
+                bullets = (role.get("responsibilities")
+                           or role.get("achievements") or [])
+                if not bullets:
+                    print(f"[warn] empty bullets for role: {role.get('title')}")
+                cls._bullets(doc, bullets)
 
         projects = cv_data.get("projects") or []
         if projects:
             cls._section_header(doc, "Projects")
             for proj in projects:
-                year = proj.get("year", "") or ""
-                cls._title_with_date(doc, proj.get("name", ""), str(year))
-                tech = proj.get("tech") or []
+                date_str = cls._fmt_range(
+                    proj.get("start_date"), proj.get("end_date"),
+                    None) or str(proj.get("year") or "")
+                proj_name = proj.get("name", "")
+                proj_link = (proj.get("link") or "").strip()
+                # Title line: name left, date right
+                title_p = cls._title_with_date(doc, proj_name, date_str)
+                # Append clickable link after the name if present
+                if proj_link and proj_link.lower() != "github":
+                    url = proj_link if proj_link.startswith("http") \
+                        else f"https://{proj_link}"
+                    title_p.add_run("  ")
+                    cls._add_hyperlink(title_p, proj_link, url)
+                elif proj_link.lower() == "github":
+                    # "GitHub" label without a real URL — render as plain text
+                    cls._add_run(title_p, "  GitHub", size=10, color="555555")
+                tech = proj.get("technologies") or proj.get("tech") or []
                 if isinstance(tech, list):
                     tech = ", ".join(tech)
                 if tech:
                     cls._subline(doc, tech)
-                desc = proj.get("description")
-                bullets = proj.get("bullets") or (
-                    [desc] if desc else [])
+                bullets = proj.get("highlights") or proj.get("bullets") or []
+                if not bullets:
+                    desc = proj.get("description") or ""
+                    if desc:
+                        bullets = [s.strip() for s in re.split(r"\.\s+", desc)
+                                   if s.strip()]
+                if not bullets:
+                    print(f"[warn] empty bullets for project: "
+                          f"{proj.get('name')}")
                 cls._bullets(doc, bullets)
 
         skills = cv_data.get("skills") or profile.get("skills") or {}
@@ -414,11 +791,23 @@ class DocxBuilder:
         if volunteering:
             cls._section_header(doc, "Volunteering & Leadership")
             for v in volunteering:
-                cls._title_with_date(doc, v.get("role", ""),
-                                     v.get("period", ""))
-                if v.get("org"):
-                    cls._subline(doc, v.get("org", ""))
-                cls._bullets(doc, v.get("bullets", []))
+                dates = cls._fmt_range(v.get("start_date"),
+                                       v.get("end_date"), None) \
+                        or v.get("period", "")
+                cls._title_with_date(doc, v.get("role", ""), dates)
+                org = v.get("organization") or v.get("org") or ""
+                if org:
+                    cls._subline(doc, org)
+                bullets = v.get("bullets") or v.get("responsibilities") or []
+                if not bullets:
+                    desc = v.get("description") or ""
+                    if desc:
+                        bullets = [s.strip() for s in re.split(r"\.\s+", desc)
+                                   if s.strip()]
+                if not bullets:
+                    print(f"[warn] empty bullets for volunteering: "
+                          f"{v.get('role')}")
+                cls._bullets(doc, bullets)
 
         achievements = cv_data.get("achievements") or []
         if achievements:
@@ -429,103 +818,79 @@ class DocxBuilder:
         if education:
             cls._section_header(doc, "Education")
             for ed in education:
-                p = doc.add_paragraph()
-                p.paragraph_format.space_before = Pt(0)
-                p.paragraph_format.space_after = Pt(0)
-                cls._add_run(p, ed.get("degree", ""), bold=True, size=11)
-                p2 = doc.add_paragraph()
-                p2.paragraph_format.tab_stops.add_tab_stop(
-                    Cm(16), WD_TAB_ALIGNMENT.RIGHT)
-                p2.paragraph_format.space_before = Pt(0)
-                p2.paragraph_format.space_after = Pt(4)
-                cls._add_run(p2, ed.get("institution", ""),
-                             italic=True, size=10.5, color="444444")
-                if ed.get("year"):
-                    p2.add_run("\t")
-                    cls._add_run(p2, str(ed.get("year", "")), size=10)
+                dates = cls._fmt_range(ed.get("start_date"),
+                                       ed.get("end_date"), None) \
+                        or str(ed.get("year") or "")
+                cls._title_with_date(doc, ed.get("degree", ""), dates)
+                inst = ed.get("institution", "")
+                if inst:
+                    cls._subline(doc, inst)
+                details = ed.get("details")
+                if details:
+                    p = doc.add_paragraph()
+                    p.paragraph_format.space_before = Pt(0)
+                    p.paragraph_format.space_after = Pt(4)
+                    cls._add_run(p, details, size=10, color="444444")
 
         doc.save(output_path)
 
     @staticmethod
-    def _fmt_dates(start, end, current):
-        """Format a role date range."""
+    def _fmt_range(start, end, current):
+        """Format a date range. Accepts start_date/end_date or start/end."""
         if current:
             end = "Present"
+        start = (start or "").strip() if isinstance(start, str) else start
+        end = (end or "").strip() if isinstance(end, str) else end
         if start and end:
             return f"{start} — {end}"
         return start or end or ""
 
 
-# ─── Workers ─────────────────────────────────────────────────────────────
+# ─── Unified Assess+Generate Worker (one call instead of two) ────────────
 
-class FitWorker(QThread):
-    """Assess candidate-JD fit via Claude."""
-    result = pyqtSignal(dict)
-    error = pyqtSignal(str)
-
-    def __init__(self, client, profile, jd):
-        """Store inputs."""
-        super().__init__()
-        self.client = client
-        self.profile = profile
-        self.jd = jd
-
-    def run(self):
-        """Execute the fit assessment call."""
-        system = (
-            "You are a recruitment expert assessing how well a candidate's "
-            "profile matches a job description.\n\n"
-            "Evaluate: core tech skills, years/depth, domain, seniority, "
-            "hard requirements.\n\n"
-            "Return JSON EXACTLY:\n"
-            "{\"fit\":\"green|yellow|red\",\"score\":0-100,"
-            "\"summary\":\"one sentence\",\"strengths\":[...],"
-            "\"gaps\":[...],\"hard_gaps\":[...]}\n\n"
-            "GREEN 70-100: strong match. YELLOW 40-69: partial, "
-            "transferable. RED 0-39: fundamental misalignment.\n"
-            "Be honest. A React dev applying to Java backend is RED. "
-            "Return ONLY the JSON, no fences."
-        )
-        user = (f"CANDIDATE PROFILE:\n{json.dumps(self.profile)}"
-                f"\n\nJOB DESCRIPTION:\n{self.jd}")
-        try:
-            msg = self._call(system, user)
-            try:
-                data = parse_json_response(msg.content[0].text)
-            except Exception:
-                msg = self._call(system + "\nSTRICT: ONLY JSON.", user)
-                try:
-                    data = parse_json_response(msg.content[0].text)
-                except Exception:
-                    data = {"fit": "yellow", "score": 50,
-                            "summary": "Parse failed — defaulted to yellow.",
-                            "strengths": [], "gaps": [], "hard_gaps": []}
-            self.result.emit(data)
-        except AuthenticationError:
-            self.error.emit("Invalid API key — check Settings")
-        except APIConnectionError:
-            self.error.emit("Connection failed — check internet")
-        except RateLimitError:
-            time.sleep(RATE_LIMIT_RETRY_SEC)
-            try:
-                msg = self._call(system, user)
-                self.result.emit(parse_json_response(msg.content[0].text))
-            except Exception as e:
-                self.error.emit(f"Rate limited: {e}")
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def _call(self, system, user):
-        """Single Anthropic call."""
-        return self.client.messages.create(
-            model=MODEL_NAME, max_tokens=2000, system=system,
-            messages=[{"role": "user", "content": user}])
+UNIFIED_SYSTEM = (
+    "Rate candidate-JD fit then write a tailored CV. "
+    "Return JSON only, no markdown:\n"
+    "{\"fit\":{\"fit\":\"green|yellow|red\",\"score\":0-100,"
+    "\"summary\":\"1 sentence\",\"strengths\":[],\"gaps\":[],"
+    "\"hard_gaps\":[]},\"cv\":{...CV JSON...},\"hard_gap\":\"\"}\n\n"
+    "FIT: green=70+, yellow=40-69, red=0-39. Be strict. No inflation.\n\n"
+    "Write CV using ONLY data from the profile provided. Rules:\n"
+    "- ONLY use skills/projects/achievements explicitly in the profile\n"
+    "- Do NOT invent metrics, tools, courses, partnerships, or quantities\n"
+    "- Mirror JD keywords naturally using real profile content only\n"
+    "- Summary: maximum 3 sentences\n"
+    "- Maximum 2 bullet points per experience entry (most JD-relevant first)\n"
+    "- Maximum 2 bullet points per volunteering entry\n"
+    "- Include ONLY the 3 most relevant projects for the JD; omit others\n"
+    "- Maximum 3 bullet points per project entry (most JD-relevant first)\n"
+    "- Order projects with most JD-relevant first\n"
+    "- The entire CV must fit comfortably on 2 pages in 11pt Calibri with "
+    "2cm margins; be ruthlessly concise, no repeated information\n"
+    "- Hard gap: still generate CV, reframe real experience to compensate; "
+    "put ONE sentence in top-level hard_gap field, never inside CV content\n"
+    "- No hard gap: leave hard_gap as empty string\n\n"
+    "CV JSON (exact keys, this order):\n"
+    "{\"summary\":\"\","
+    "\"experience\":[{\"title\":\"\",\"company\":\"\",\"location\":\"\","
+    "\"start_date\":\"\",\"end_date\":\"\",\"responsibilities\":[]}],"
+    "\"projects\":[{\"name\":\"\",\"description\":\"\","
+    "\"technologies\":[],\"highlights\":[]}],"
+    "\"skills\":{\"languages\":[],\"frontend\":[],\"backend\":[],"
+    "\"databases\":[],\"cloud\":[],\"ai_integrations\":[],"
+    "\"third_party_apis\":[],\"erp\":[]},"
+    "\"volunteering\":[{\"role\":\"\",\"organization\":\"\","
+    "\"start_date\":\"\",\"end_date\":\"\",\"description\":\"\"}],"
+    "\"achievements\":[],"
+    "\"education\":[{\"degree\":\"\",\"institution\":\"\","
+    "\"start_date\":\"\",\"end_date\":\"\",\"details\":\"\"}]}"
+)
 
 
-class CVWorker(QThread):
-    """Generate tailored CV data via Claude."""
+class UnifiedWorker(QThread):
+    """Single-call fit assessment + CV generation."""
     progress = pyqtSignal(int)
-    result = pyqtSignal(dict, str)  # cv_data, hard_gap
+    result = pyqtSignal(dict, dict, str)  # fit, cv, hard_gap
     error = pyqtSignal(str)
 
     def __init__(self, client, profile, company, title, jd):
@@ -538,67 +903,56 @@ class CVWorker(QThread):
         self.jd = jd
 
     def run(self):
-        """Execute CV generation call."""
-        system = (
-            "You are an expert CV writer. Generate a tailored CV for the "
-            "job using the candidate's master profile.\n\n"
-            "SECTION ORDER: 1.Summary 2.Experience 3.Projects (relevant "
-            "only) 4.Technical Skills 5.Volunteering 6.Achievements "
-            "7.Education.\n\n"
-            "RULES: mirror JD keywords naturally, prioritise relevant "
-            "experience, strong action verbs, quantify when data exists, "
-            "NEVER invent roles/companies/projects, must fit 2 pages.\n\n"
-            "GAPS: learnable gaps — include, frame as fast-learning. "
-            "Hard gaps — generate anyway, reframe existing experience. "
-            "After JSON, new line: HARD_GAP: [one sentence] if applicable. "
-            "NEVER put HARD_GAP inside CV content.\n\n"
-            "OUTPUT: JSON matching master profile schema (same structure, "
-            "tailored content). Optional HARD_GAP line after. No fences."
-        )
+        """Execute the combined assessment+generation call."""
+        compact = compress_profile(self.profile)
         user = (f"COMPANY: {self.company}\nTITLE: {self.title}\n"
-                f"JD:\n{self.jd}\n\nMASTER PROFILE:\n"
-                f"{json.dumps(self.profile)}")
-        self.progress.emit(20)
+                f"JD:\n{self.jd}\n\nMASTER_PROFILE:{compact}")
+        self.progress.emit(15)
         try:
-            msg = self._call(system, user)
+            text = claude_call(self.client, UNIFIED_SYSTEM, user,
+                               MAX_TOKENS_UNIFIED)
             self.progress.emit(80)
-            text = msg.content[0].text
-            hard_gap = ""
-            m = re.search(r"HARD_GAP\s*:\s*(.+)", text)
-            if m:
-                hard_gap = m.group(1).strip()
-                text = text[:m.start()]
-            try:
-                cv = parse_json_response(text)
-            except Exception:
-                msg = self._call(system + "\nSTRICT: ONLY JSON.", user)
-                text = msg.content[0].text
-                m = re.search(r"HARD_GAP\s*:\s*(.+)", text)
-                if m:
-                    hard_gap = m.group(1).strip()
-                    text = text[:m.start()]
-                cv = parse_json_response(text)
+            data = self._parse(text)
+            fit = data.get("fit") or {}
+            cv = validate_cv_output(data.get("cv") or {}, self.profile)
+            hard_gap = data.get("hard_gap", "") or ""
             self.progress.emit(100)
-            self.result.emit(cv, hard_gap)
+            self.result.emit(fit, cv, hard_gap)
         except AuthenticationError:
             self.error.emit("Invalid API key — check Settings")
         except APIConnectionError:
             self.error.emit("Connection failed — check internet")
-        except RateLimitError:
-            time.sleep(RATE_LIMIT_RETRY_SEC)
-            try:
-                msg = self._call(system, user)
-                self.result.emit(parse_json_response(msg.content[0].text), "")
-            except Exception as e:
-                self.error.emit(f"Rate limited: {e}")
         except Exception as e:
             self.error.emit(str(e))
 
-    def _call(self, system, user):
-        """Single Anthropic call."""
-        return self.client.messages.create(
-            model=MODEL_NAME, max_tokens=MAX_TOKENS, system=system,
-            messages=[{"role": "user", "content": user}])
+    def _parse(self, text):
+        """Parse JSON; on failure retry once with an explicit format reminder."""
+        body, _ = strip_hard_gap(text)
+        try:
+            return parse_json_response(body)
+        except Exception:
+            pass
+        # Retry with a hard format instruction
+        retry_suffix = (
+            "\nIMPORTANT: Return ONLY a raw JSON object. No markdown, "
+            "no backticks, no explanation. Start your response with { "
+            "and end with }"
+        )
+        text2 = claude_call(
+            self.client,
+            UNIFIED_SYSTEM + retry_suffix,
+            f"COMPANY:{self.company}\nTITLE:{self.title}"
+            f"\nJD:\n{self.jd}\n\nPROFILE:{compress_profile(self.profile)}",
+            MAX_TOKENS_UNIFIED,
+        )
+        body2, _ = strip_hard_gap(text2)
+        try:
+            return parse_json_response(body2)
+        except Exception as exc:
+            raise ValueError(
+                "CV generation failed — Claude returned unexpected format. "
+                "Check console for details. Try again."
+            ) from exc
 
 
 class ProfileBuildWorker(QThread):
@@ -656,7 +1010,9 @@ class SettingsTab(QWidget):
 
         layout.addWidget(QLabel("Anthropic API Key"))
         key_row = QHBoxLayout()
-        self.key_edit = QLineEdit(cfg.get("api_key", ""))
+        stored_key = cfg.get("api_key", "")
+        display_key = stored_key if stored_key.startswith("sk-ant-") else ""
+        self.key_edit = QLineEdit(display_key)
         self.key_edit.setEchoMode(QLineEdit.Password)
         self.show_btn = QPushButton("Show")
         self.show_btn.setCheckable(True)
@@ -704,8 +1060,14 @@ class SettingsTab(QWidget):
             self.folder_edit.setText(d)
 
     def _save(self):
-        """Save config to disk."""
-        self.cfg["api_key"] = self.key_edit.text().strip()
+        """Save config to disk, rejecting keys with wrong prefix."""
+        key = self.key_edit.text().strip()
+        if key and not key.startswith("sk-ant-"):
+            self.saved_lbl.setText(
+                "Invalid API key format — should start with sk-ant-")
+            self.saved_lbl.setStyleSheet(f"color:{RED};")
+            return
+        self.cfg["api_key"] = key
         self.cfg["output_folder"] = self.folder_edit.text().strip() \
             or DEFAULT_OUTPUT
         save_config(self.cfg)
@@ -731,7 +1093,6 @@ class ProfileTab(QWidget):
         outer = QHBoxLayout(self)
         outer.setContentsMargins(15, 15, 15, 15)
 
-        # LEFT
         left = QGroupBox("Build / Update Profile")
         lv = QVBoxLayout(left)
         pick = QPushButton("Add Files (PDF, DOCX, TXT)…")
@@ -757,7 +1118,6 @@ class ProfileTab(QWidget):
         view_raw.clicked.connect(self._view_raw)
         lv.addWidget(view_raw)
 
-        # RIGHT
         right = QGroupBox("Current Profile Summary")
         rv = QVBoxLayout(right)
         self.summary = QTextEdit()
@@ -831,8 +1191,7 @@ class ProfileTab(QWidget):
         if os.path.exists(PROFILE_FILE):
             subprocess.Popen(["notepad.exe", PROFILE_FILE])
         else:
-            QMessageBox.information(self, "No Profile",
-                                    "No profile file yet.")
+            QMessageBox.information(self, "No Profile", "No profile yet.")
 
     def _clear(self):
         """Clear profile after confirmation."""
@@ -874,7 +1233,7 @@ class ProfileTab(QWidget):
 
 
 class SingleJobTab(QWidget):
-    """Paste one JD, assess, generate CV."""
+    """Paste one JD, assess + generate in a single call."""
 
     def __init__(self, get_client, get_profile, get_output):
         """Build UI."""
@@ -882,10 +1241,9 @@ class SingleJobTab(QWidget):
         self.get_client = get_client
         self.get_profile = get_profile
         self.get_output = get_output
-        self.fit_worker = None
-        self.cv_worker = None
+        self.worker = None
         self.output_path = None
-        self.pending_red = None
+        self._cached = None  # (fit, cv, hard_gap) pending RED decision
 
         v = QVBoxLayout(self)
         v.setContentsMargins(15, 15, 15, 15)
@@ -963,7 +1321,7 @@ class SingleJobTab(QWidget):
         self.go_btn.setEnabled(bool(ok))
 
     def _start(self):
-        """Kick off fit assessment."""
+        """Kick off unified assess+generate call."""
         client = self.get_client()
         profile = self.get_profile()
         if not client:
@@ -980,39 +1338,37 @@ class SingleJobTab(QWidget):
         self.open_file_btn.setVisible(False)
         self.open_folder_btn.setVisible(False)
         self.go_btn.setEnabled(False)
-        self.phase_lbl.setText("Assessing fit…")
-        self.progress.setRange(0, 0)
-        self.fit_worker = FitWorker(client, profile,
-                                    self.jd.toPlainText())
-        self.fit_worker.result.connect(self._on_fit)
-        self.fit_worker.error.connect(self._on_error)
-        self.fit_worker.start()
-
-    def _on_fit(self, data):
-        """Handle fit result."""
-        self.progress.setRange(0, 100)
+        self.phase_lbl.setText("Assessing fit & drafting CV…")
         self.progress.setValue(0)
-        fit = data.get("fit", "yellow").lower()
-        summary = data.get("summary", "")
-        gaps = data.get("gaps", []) or []
-        hard = data.get("hard_gaps", []) or []
-        if fit == "green":
-            self._show_fit(GREEN,
-                           f"Strong fit — generating your CV\n{summary}")
-            self._start_cv()
-        elif fit == "yellow":
+        self.worker = UnifiedWorker(client, profile, self.company.text(),
+                                    self.title.text(), self.jd.toPlainText())
+        self.worker.progress.connect(self.progress.setValue)
+        self.worker.result.connect(self._on_result)
+        self.worker.error.connect(self._on_error)
+        self.worker.start()
+
+    def _on_result(self, fit, cv, hard_gap):
+        """Handle unified result: render fit + gate on RED."""
+        level = (fit.get("fit") or "yellow").lower()
+        summary = fit.get("summary", "")
+        gaps = fit.get("gaps", []) or []
+        hard = fit.get("hard_gaps", []) or []
+        self._cached = (fit, cv, hard_gap)
+
+        if level == "green":
+            self._show_fit(GREEN, f"Strong fit — generating your CV\n{summary}")
+            self._write_cv()
+        elif level == "yellow":
             g = "; ".join(gaps) if gaps else "minor"
             self._show_fit(YELLOW,
-                           f"Partial fit — {g} — generating anyway\n"
-                           f"{summary}")
-            self._start_cv()
+                           f"Partial fit — {g} — generating anyway\n{summary}")
+            self._write_cv()
         else:
             reason = summary + ("\nHard gaps: " + "; ".join(hard)
                                 if hard else "")
             self._show_fit(RED, f"Poor fit — {reason}")
             self.red_row.setVisible(True)
             self.phase_lbl.setText("Waiting for your decision…")
-            self.pending_red = True
 
     def _show_fit(self, color, text):
         """Display the fit box."""
@@ -1022,38 +1378,29 @@ class SingleJobTab(QWidget):
         self.fit_box.setVisible(True)
 
     def _red_generate(self):
-        """User overrode RED."""
+        """User overrode RED — write CV from cache."""
         self.red_row.setVisible(False)
-        self._start_cv()
+        self._write_cv()
 
     def _red_skip(self):
         """User skipped RED."""
         self.red_row.setVisible(False)
         self.phase_lbl.setText("Skipped.")
-        self.progress.setValue(0)
+        self._cached = None
         self.go_btn.setEnabled(True)
 
-    def _start_cv(self):
-        """Kick off CV generation."""
-        client = self.get_client()
-        profile = self.get_profile()
-        self.phase_lbl.setText("Generating CV…")
-        self.progress.setValue(0)
-        self.cv_worker = CVWorker(client, profile, self.company.text(),
-                                  self.title.text(), self.jd.toPlainText())
-        self.cv_worker.progress.connect(self.progress.setValue)
-        self.cv_worker.result.connect(self._on_cv)
-        self.cv_worker.error.connect(self._on_error)
-        self.cv_worker.start()
-
-    def _on_cv(self, cv_data, hard_gap):
-        """Write DOCX and show result."""
+    def _write_cv(self):
+        """Write cached CV data to DOCX."""
+        if not self._cached:
+            self.go_btn.setEnabled(True)
+            return
+        _, cv, hard_gap = self._cached
         try:
             profile = self.get_profile()
             self.output_path = build_output_path(self.get_output(),
                                                  self.company.text(),
                                                  self.title.text())
-            DocxBuilder.build(profile, cv_data, self.output_path)
+            DocxBuilder.build(profile, cv, self.output_path)
             self.phase_lbl.setText("Done.")
             self.file_lbl.setText(
                 f"Generated: {os.path.basename(self.output_path)}")
@@ -1071,7 +1418,6 @@ class SingleJobTab(QWidget):
 
     def _on_error(self, msg):
         """Show error state."""
-        self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.phase_lbl.setText(f"Error: {msg}")
         self.go_btn.setEnabled(True)
@@ -1096,8 +1442,9 @@ def parse_bulk_input(text):
 
 
 class BulkRunner(QThread):
-    """Sequentially assess+generate a list of jobs, with RED pause support."""
-    row_update = pyqtSignal(int, str, str)  # row, column_name, value
+    """Sequentially assess+generate with RED pause support. One API call
+    per job via UNIFIED_SYSTEM."""
+    row_update = pyqtSignal(int, str, str)
     waiting_for_decision = pyqtSignal(int, str, list)
     done = pyqtSignal()
 
@@ -1111,10 +1458,10 @@ class BulkRunner(QThread):
         self._stop = False
         self._decision_event = threading.Event()
         self._decision = None
-        self.results = []  # dicts per row for CSV
+        self.results = []
 
     def stop(self):
-        """Request stop after current job."""
+        """Request stop — unblocks any pending decision wait."""
         self._stop = True
         self._decision_event.set()
 
@@ -1133,14 +1480,16 @@ class BulkRunner(QThread):
                           "Strengths": "", "Gaps": "", "Hard Gaps": "",
                           "Status": "", "Gap Note": "", "Filename": "",
                           "Date": datetime.now().strftime("%Y-%m-%d")}
-            self.row_update.emit(i, "Status", "Assessing")
-            fit = self._assess(jd)
-            if not fit:
+            self.row_update.emit(i, "Status", "Assessing & drafting")
+            fit, cv, hard_gap = self._unified(company, title, jd)
+            if fit is None:
                 self.row_update.emit(i, "Status", "✗ Error")
                 row_result["Status"] = "Error"
                 self.results.append(row_result)
+                time.sleep(BULK_DELAY_SEC)
                 continue
-            level = fit.get("fit", "yellow").lower()
+
+            level = (fit.get("fit") or "yellow").lower()
             icon = {"green": "🟢 Strong", "yellow": "🟡 Partial",
                     "red": "🔴 Poor"}.get(level, "🟡 Partial")
             self.row_update.emit(i, "Fit", icon)
@@ -1151,36 +1500,28 @@ class BulkRunner(QThread):
             row_result["Gaps"] = "; ".join(fit.get("gaps", []))
             row_result["Hard Gaps"] = "; ".join(fit.get("hard_gaps", []))
 
-            proceed = True
             if level == "red":
-                self.row_update.emit(
-                    i, "Status", "⚠ Poor Fit — waiting...")
+                self.row_update.emit(i, "Status", "⚠ Poor Fit — waiting...")
                 self._decision_event.clear()
                 self._decision = None
                 self.waiting_for_decision.emit(
                     i, fit.get("summary", ""), fit.get("hard_gaps", []))
                 self._decision_event.wait()
                 if self._stop:
+                    row_result["Status"] = "Skipped"
+                    self.results.append(row_result)
                     break
-                proceed = (self._decision == "generate")
-                if not proceed:
+                if self._decision != "generate":
                     self.row_update.emit(i, "Status", "✗ Skipped")
                     row_result["Status"] = "Skipped"
                     self.results.append(row_result)
                     time.sleep(BULK_DELAY_SEC)
                     continue
 
-            self.row_update.emit(i, "Status", "Generating")
-            cv, hard_gap = self._generate(company, title, jd)
-            if cv is None:
-                self.row_update.emit(i, "Status", "✗ Error")
-                row_result["Status"] = "Error"
-                self.results.append(row_result)
-                time.sleep(BULK_DELAY_SEC)
-                continue
+            self.row_update.emit(i, "Status", "Writing DOCX")
             try:
                 path = build_output_path(self.output, company, title)
-                DocxBuilder.build(self.profile, cv, path)
+                DocxBuilder.build(self.profile, cv or {}, path)
                 self.row_update.emit(i, "Status", "✓ Done")
                 self.row_update.emit(i, "Filename", os.path.basename(path))
                 row_result["Status"] = "Done"
@@ -1195,58 +1536,41 @@ class BulkRunner(QThread):
             time.sleep(BULK_DELAY_SEC)
         self.done.emit()
 
-    def _assess(self, jd):
-        """Synchronous fit call."""
-        system = (
-            "You are a recruitment expert. Return JSON: "
-            "{\"fit\":\"green|yellow|red\",\"score\":0-100,"
-            "\"summary\":\"\",\"strengths\":[],\"gaps\":[],"
-            "\"hard_gaps\":[]}. GREEN 70-100, YELLOW 40-69, RED 0-39. "
-            "Be honest. Return ONLY JSON.")
-        user = (f"CANDIDATE PROFILE:\n{json.dumps(self.profile)}"
-                f"\n\nJOB DESCRIPTION:\n{jd}")
-        try:
-            msg = self.client.messages.create(
-                model=MODEL_NAME, max_tokens=2000, system=system,
-                messages=[{"role": "user", "content": user}])
-            return parse_json_response(msg.content[0].text)
-        except RateLimitError:
-            time.sleep(RATE_LIMIT_RETRY_SEC)
-            try:
-                msg = self.client.messages.create(
-                    model=MODEL_NAME, max_tokens=2000, system=system,
-                    messages=[{"role": "user", "content": user}])
-                return parse_json_response(msg.content[0].text)
-            except Exception:
-                return {"fit": "yellow", "score": 50,
-                        "summary": "Rate-limited, defaulted",
-                        "strengths": [], "gaps": [], "hard_gaps": []}
-        except Exception:
-            return None
-
-    def _generate(self, company, title, jd):
-        """Synchronous CV call."""
-        system = (
-            "Expert CV writer. SECTIONS: Summary, Experience, Projects "
-            "(relevant), Technical Skills, Volunteering, Achievements, "
-            "Education. Mirror JD language. Never invent. 2 pages. "
-            "Output JSON matching master profile schema. Optional "
-            "HARD_GAP line after JSON. No fences.")
+    def _unified(self, company, title, jd):
+        """Single combined fit+CV call. Returns (fit, cv, hard_gap) or
+        (None, None, '') on error."""
+        compact = compress_profile(self.profile)
         user = (f"COMPANY: {company}\nTITLE: {title}\nJD:\n{jd}"
-                f"\n\nMASTER PROFILE:\n{json.dumps(self.profile)}")
+                f"\n\nMASTER_PROFILE:{compact}")
         try:
-            msg = self.client.messages.create(
-                model=MODEL_NAME, max_tokens=MAX_TOKENS, system=system,
-                messages=[{"role": "user", "content": user}])
-            text = msg.content[0].text
-            hard = ""
-            m = re.search(r"HARD_GAP\s*:\s*(.+)", text)
-            if m:
-                hard = m.group(1).strip()
-                text = text[:m.start()]
-            return parse_json_response(text), hard
+            text = claude_call(self.client, UNIFIED_SYSTEM, user,
+                               MAX_TOKENS_UNIFIED)
+            body, _ = strip_hard_gap(text)
+            data = parse_json_response(body)
+            return (data.get("fit") or {},
+                    validate_cv_output(data.get("cv") or {}, self.profile),
+                    data.get("hard_gap", "") or "")
+        except AuthenticationError:
+            return None, None, ""
+        except APIConnectionError:
+            return None, None, ""
         except Exception:
-            return None, ""
+            # Parse retry with explicit format reminder
+            retry_suffix = (
+                "\nIMPORTANT: Return ONLY a raw JSON object. No markdown, "
+                "no backticks, no explanation. Start your response with { "
+                "and end with }"
+            )
+            try:
+                text = claude_call(self.client, UNIFIED_SYSTEM + retry_suffix,
+                                   user, MAX_TOKENS_UNIFIED)
+                body, _ = strip_hard_gap(text)
+                data = parse_json_response(body)
+                return (data.get("fit") or {},
+                        validate_cv_output(data.get("cv") or {}, self.profile),
+                        data.get("hard_gap", "") or "")
+            except Exception:
+                return None, None, ""
 
 
 class BulkTab(QWidget):
@@ -1261,7 +1585,7 @@ class BulkTab(QWidget):
         self.get_profile = get_profile
         self.get_output = get_output
         self.runner = None
-        self.pending_rows = {}  # row -> inline widget
+        self.pending_rows = {}
 
         v = QVBoxLayout(self)
         v.setContentsMargins(15, 15, 15, 15)
@@ -1364,13 +1688,11 @@ class BulkTab(QWidget):
 
     def _set(self, row, col, text):
         """Set a cell by index."""
-        item = QTableWidgetItem(text)
-        self.table.setItem(row, col, item)
+        self.table.setItem(row, col, QTableWidgetItem(text))
 
     def _col_index(self, name):
         """Map column name to index."""
-        mapping = {"Status": 4, "Fit": 3, "Gap": 5, "Filename": 6}
-        return mapping.get(name, 4)
+        return {"Status": 4, "Fit": 3, "Gap": 5, "Filename": 6}.get(name, 4)
 
     def _on_row(self, row, col_name, value):
         """Update a row cell."""
@@ -1379,11 +1701,9 @@ class BulkTab(QWidget):
         if item:
             item.setText(value)
         if col_name == "Status":
-            if value.startswith("✓"):
+            if value.startswith("✓") or value.startswith("✗"):
                 self.progress.setValue(self.progress.value() + 1)
-            elif value.startswith("✗"):
-                self.progress.setValue(self.progress.value() + 1)
-                if "Skipped" not in value:
+                if value.startswith("✗") and "Skipped" not in value:
                     self._highlight_row(row, "#3d1a1a")
             if "Poor Fit" in value:
                 self._highlight_row(row, "#3d1a1a")

@@ -1,0 +1,21 @@
+# Secrets & personal data — NEVER commit these
+config.json
+master_profile.json
+
+# Generated CVs
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
