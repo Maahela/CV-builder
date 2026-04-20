@@ -222,12 +222,50 @@ _FIELD_SHORTS = {
     "organization": "org", "description": "desc",
     "technologies": "tech", "highlights": "pts",
 }
+_DROP_TOP_KEYS = {"interests", "certifications"}
+_DROP_EXP_KEYS = {"location"}
+
+
+def slim_profile_for_generation(profile):
+    """Drop noise fields Claude doesn't need. Keeps the cached payload small."""
+    if not profile:
+        return {}
+    out = {}
+    for k, v in profile.items():
+        if k in _DROP_TOP_KEYS or v in (None, "", [], {}):
+            continue
+        if k == "experience" and isinstance(v, list):
+            out[k] = [
+                {ek: ev for ek, ev in exp.items()
+                 if ek not in _DROP_EXP_KEYS and ev not in (None, "", [], {})}
+                for exp in v if isinstance(exp, dict)
+            ]
+        elif isinstance(v, dict):
+            sub = {sk: sv for sk, sv in v.items()
+                   if sv not in (None, "", [], {})}
+            if sub:
+                out[k] = sub
+        elif isinstance(v, list):
+            cleaned = []
+            for item in v:
+                if isinstance(item, dict):
+                    ci = {ik: iv for ik, iv in item.items()
+                          if iv not in (None, "", [], {})}
+                    if ci:
+                        cleaned.append(ci)
+                elif item not in (None, "", [], {}):
+                    cleaned.append(item)
+            if cleaned:
+                out[k] = cleaned
+        else:
+            out[k] = v
+    return out
 
 
 def compress_profile(profile):
-    """Trim empty fields then shorten common key names to save input tokens."""
-    trimmed = trim_profile(profile)
-    text = json.dumps(trimmed, separators=(",", ":"))
+    """Slim, serialize tight, and shorten common keys to save input tokens."""
+    slim = slim_profile_for_generation(profile)
+    text = json.dumps(slim, separators=(",", ":"))
     for long, short in _FIELD_SHORTS.items():
         text = text.replace(f'"{long}":', f'"{short}":')
     return text
@@ -357,6 +395,18 @@ def safe_merge_profiles(old, new):
 
 # ─── Claude call wrapper with parse-retry + rate-limit retry ─────────────
 
+def _log_usage(msg, text):
+    """Emit token + cache stats when DEBUG_CV is on."""
+    if not DEBUG_CV:
+        return
+    u = msg.usage
+    cc = getattr(u, "cache_creation_input_tokens", 0) or 0
+    cr = getattr(u, "cache_read_input_tokens", 0) or 0
+    print(f"[DEBUG] in={u.input_tokens} out={u.output_tokens} "
+          f"cache_created={cc} cache_read={cr} "
+          f"chars={len(text)} preview={text[:200]!r}")
+
+
 def claude_call(client, system, user, max_tokens, retries=1):
     """Call Anthropic once, retrying on RateLimit once. Returns raw text."""
     last_err = None
@@ -366,10 +416,48 @@ def claude_call(client, system, user, max_tokens, retries=1):
                 model=MODEL_NAME, max_tokens=max_tokens, system=system,
                 messages=[{"role": "user", "content": user}])
             text = msg.content[0].text
-            if DEBUG_CV:
-                usage = msg.usage
-                print(f"[DEBUG] in={usage.input_tokens} out={usage.output_tokens} "
-                      f"chars={len(text)} preview={text[:200]!r}")
+            _log_usage(msg, text)
+            return text
+        except RateLimitError as e:
+            last_err = e
+            time.sleep(RATE_LIMIT_RETRY_SEC)
+            continue
+    raise last_err
+
+
+def claude_call_cached(client, system, cached_user, fresh_user,
+                       max_tokens, retries=1):
+    """Like claude_call, but marks system + cached_user for prompt caching.
+
+    Cached blocks cost 10% of the normal input rate on a cache-hit and
+    ~125% on cache creation. For the CV generation flow, system prompt
+    and profile are static across calls, only the JD changes.
+    """
+    last_err = None
+    for _ in range(retries + 2):
+        try:
+            msg = client.messages.create(
+                model=MODEL_NAME,
+                max_tokens=max_tokens,
+                system=[{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": cached_user,
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {"type": "text", "text": fresh_user},
+                    ],
+                }],
+            )
+            text = msg.content[0].text
+            _log_usage(msg, text)
             return text
         except RateLimitError as e:
             last_err = e
@@ -740,7 +828,8 @@ class DocxBuilder:
                 sub = comp + (f" — {loc}" if loc else "")
                 if sub.strip():
                     cls._subline(doc, sub)
-                bullets = (role.get("responsibilities")
+                bullets = (role.get("bullets")
+                           or role.get("responsibilities")
                            or role.get("achievements") or [])
                 if not bullets:
                     print(f"[warn] empty bullets for role: {role.get('title')}")
@@ -849,41 +938,34 @@ class DocxBuilder:
 # ─── Unified Assess+Generate Worker (one call instead of two) ────────────
 
 UNIFIED_SYSTEM = (
-    "Rate candidate-JD fit then write a tailored CV. "
+    "You are a CV writer. Generate a tailored CV using ONLY the "
+    "candidate's profile data. Do not invent skills, projects, metrics, "
+    "or achievements.\n\n"
     "Return JSON only, no markdown:\n"
     "{\"fit\":{\"fit\":\"green|yellow|red\",\"score\":0-100,"
     "\"summary\":\"1 sentence\",\"strengths\":[],\"gaps\":[],"
-    "\"hard_gaps\":[]},\"cv\":{...CV JSON...},\"hard_gap\":\"\"}\n\n"
-    "FIT: green=70+, yellow=40-69, red=0-39. Be strict. No inflation.\n\n"
-    "Write CV using ONLY data from the profile provided. Rules:\n"
-    "- ONLY use skills/projects/achievements explicitly in the profile\n"
-    "- Do NOT invent metrics, tools, courses, partnerships, or quantities\n"
-    "- Mirror JD keywords naturally using real profile content only\n"
-    "- Summary: maximum 3 sentences\n"
-    "- Maximum 2 bullet points per experience entry (most JD-relevant first)\n"
-    "- Maximum 2 bullet points per volunteering entry\n"
-    "- Include ONLY the 3 most relevant projects for the JD; omit others\n"
-    "- Maximum 3 bullet points per project entry (most JD-relevant first)\n"
-    "- Order projects with most JD-relevant first\n"
-    "- The entire CV must fit comfortably on 2 pages in 11pt Calibri with "
-    "2cm margins; be ruthlessly concise, no repeated information\n"
-    "- Hard gap: still generate CV, reframe real experience to compensate; "
-    "put ONE sentence in top-level hard_gap field, never inside CV content\n"
-    "- No hard gap: leave hard_gap as empty string\n\n"
-    "CV JSON (exact keys, this order):\n"
-    "{\"summary\":\"\","
-    "\"experience\":[{\"title\":\"\",\"company\":\"\",\"location\":\"\","
-    "\"start_date\":\"\",\"end_date\":\"\",\"responsibilities\":[]}],"
-    "\"projects\":[{\"name\":\"\",\"description\":\"\","
-    "\"technologies\":[],\"highlights\":[]}],"
-    "\"skills\":{\"languages\":[],\"frontend\":[],\"backend\":[],"
-    "\"databases\":[],\"cloud\":[],\"ai_integrations\":[],"
-    "\"third_party_apis\":[],\"erp\":[]},"
+    "\"hard_gaps\":[]},"
+    "\"cv\":{"
+    "\"summary\":\"max 3 sentences tailored to JD\","
+    "\"experience\":[{\"title\":\"\",\"company\":\"\","
+    "\"start_date\":\"\",\"end_date\":\"\",\"bullets\":[]}],"
+    "\"projects\":[{\"name\":\"\",\"technologies\":[],\"bullets\":[]}],"
+    "\"skills\":{same category keys as profile; items verbatim},"
     "\"volunteering\":[{\"role\":\"\",\"organization\":\"\","
-    "\"start_date\":\"\",\"end_date\":\"\",\"description\":\"\"}],"
-    "\"achievements\":[],"
-    "\"education\":[{\"degree\":\"\",\"institution\":\"\","
-    "\"start_date\":\"\",\"end_date\":\"\",\"details\":\"\"}]}"
+    "\"start_date\":\"\",\"end_date\":\"\",\"bullets\":[]}],"
+    "\"achievements\":[verbatim from profile],"
+    "\"education\":[verbatim from profile]},"
+    "\"hard_gap\":\"one sentence if hard gap else empty\"}\n\n"
+    "Rules:\n"
+    "- Section order: summary, experience, projects, skills, "
+    "volunteering, achievements, education\n"
+    "- Include ONLY the 3 most relevant projects for the JD\n"
+    "- Max 2 bullets per experience entry (most JD-relevant first)\n"
+    "- Max 2 bullets per volunteering entry\n"
+    "- Max 3 bullets per project entry (most JD-relevant first)\n"
+    "- Use verbatim skills/achievements from profile — never modify\n"
+    "- Mirror JD keywords using real profile content only\n"
+    "- Fit: green=70+, yellow=40-69, red=0-39. Be strict."
 )
 
 
@@ -905,12 +987,15 @@ class UnifiedWorker(QThread):
     def run(self):
         """Execute the combined assessment+generation call."""
         compact = compress_profile(self.profile)
-        user = (f"COMPANY: {self.company}\nTITLE: {self.title}\n"
-                f"JD:\n{self.jd}\n\nMASTER_PROFILE:{compact}")
+        cached_user = f"CANDIDATE PROFILE:\n{compact}"
+        fresh_user = (f"COMPANY: {self.company}\nTITLE: {self.title}\n"
+                      f"JOB DESCRIPTION:\n{self.jd}\n\n"
+                      f"Generate the tailored CV.")
         self.progress.emit(15)
         try:
-            text = claude_call(self.client, UNIFIED_SYSTEM, user,
-                               MAX_TOKENS_UNIFIED)
+            text = claude_call_cached(self.client, UNIFIED_SYSTEM,
+                                      cached_user, fresh_user,
+                                      MAX_TOKENS_UNIFIED)
             self.progress.emit(80)
             data = self._parse(text)
             fit = data.get("fit") or {}
@@ -938,11 +1023,14 @@ class UnifiedWorker(QThread):
             "no backticks, no explanation. Start your response with { "
             "and end with }"
         )
-        text2 = claude_call(
+        cached_user = f"CANDIDATE PROFILE:\n{compress_profile(self.profile)}"
+        fresh_user = (f"COMPANY: {self.company}\nTITLE: {self.title}\n"
+                      f"JOB DESCRIPTION:\n{self.jd}\n\n"
+                      f"Generate the tailored CV.")
+        text2 = claude_call_cached(
             self.client,
             UNIFIED_SYSTEM + retry_suffix,
-            f"COMPANY:{self.company}\nTITLE:{self.title}"
-            f"\nJD:\n{self.jd}\n\nPROFILE:{compress_profile(self.profile)}",
+            cached_user, fresh_user,
             MAX_TOKENS_UNIFIED,
         )
         body2, _ = strip_hard_gap(text2)
@@ -1540,11 +1628,14 @@ class BulkRunner(QThread):
         """Single combined fit+CV call. Returns (fit, cv, hard_gap) or
         (None, None, '') on error."""
         compact = compress_profile(self.profile)
-        user = (f"COMPANY: {company}\nTITLE: {title}\nJD:\n{jd}"
-                f"\n\nMASTER_PROFILE:{compact}")
+        cached_user = f"CANDIDATE PROFILE:\n{compact}"
+        fresh_user = (f"COMPANY: {company}\nTITLE: {title}\n"
+                      f"JOB DESCRIPTION:\n{jd}\n\n"
+                      f"Generate the tailored CV.")
         try:
-            text = claude_call(self.client, UNIFIED_SYSTEM, user,
-                               MAX_TOKENS_UNIFIED)
+            text = claude_call_cached(self.client, UNIFIED_SYSTEM,
+                                      cached_user, fresh_user,
+                                      MAX_TOKENS_UNIFIED)
             body, _ = strip_hard_gap(text)
             data = parse_json_response(body)
             return (data.get("fit") or {},
@@ -1562,8 +1653,9 @@ class BulkRunner(QThread):
                 "and end with }"
             )
             try:
-                text = claude_call(self.client, UNIFIED_SYSTEM + retry_suffix,
-                                   user, MAX_TOKENS_UNIFIED)
+                text = claude_call_cached(
+                    self.client, UNIFIED_SYSTEM + retry_suffix,
+                    cached_user, fresh_user, MAX_TOKENS_UNIFIED)
                 body, _ = strip_hard_gap(text)
                 data = parse_json_response(body)
                 return (data.get("fit") or {},
