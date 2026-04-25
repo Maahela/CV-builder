@@ -69,12 +69,29 @@ PROFILE_SCHEMA = {
     "achievements": [], "interests": []
 }
 
-SKILL_CATEGORIES = [
-    ("languages", "Languages"), ("frontend", "Frontend"),
-    ("backend", "Backend"), ("databases", "Databases"),
-    ("cloud", "Cloud & DevOps"), ("ai_integrations", "AI / Integrations"),
-    ("third_party_apis", "Third-Party APIs"), ("erp", "ERP"),
+ALWAYS_SHOW_SKILLS = [
+    "languages", "frontend", "backend", "databases",
+    "cloud", "ai_integrations", "third_party_apis",
 ]
+
+CONDITIONAL_SKILLS = [
+    "erp", "desktop_gui", "productivity_tools", "design_collaboration",
+    "analytics_tools", "dev_tools", "soft_skills", "languages_spoken",
+]
+
+SKILL_LABELS = {
+    "languages": "Languages", "frontend": "Frontend",
+    "backend": "Backend", "databases": "Databases",
+    "cloud": "Cloud & DevOps", "ai_integrations": "AI / Integrations",
+    "third_party_apis": "Third-Party APIs", "erp": "ERP",
+    "desktop_gui": "Desktop / GUI", "productivity_tools": "Productivity",
+    "design_collaboration": "Design & Collab",
+    "analytics_tools": "Analytics", "dev_tools": "Dev Tools",
+    "soft_skills": "Soft Skills", "languages_spoken": "Languages Spoken",
+}
+
+# Ordered list of all categories for profile display
+SKILL_CATEGORIES = [(k, v) for k, v in SKILL_LABELS.items()]
 
 
 # ─── Config / IO helpers ─────────────────────────────────────────────────
@@ -756,8 +773,9 @@ class DocxBuilder:
     @classmethod
     def _skills_table(cls, doc, skills):
         """Two-column borderless table of skill categories."""
-        rows = [(label, skills.get(key, []))
-                for key, label in SKILL_CATEGORIES
+        ordered = ALWAYS_SHOW_SKILLS + CONDITIONAL_SKILLS
+        rows = [(SKILL_LABELS[key], skills[key])
+                for key in ordered
                 if skills.get(key)]
         if not rows:
             return
@@ -871,10 +889,20 @@ class DocxBuilder:
                           f"{proj.get('name')}")
                 cls._bullets(doc, bullets)
 
-        skills = cv_data.get("skills") or profile.get("skills") or {}
-        if any(skills.get(k) for k, _ in SKILL_CATEGORIES):
+        cv_skills = cv_data.get("skills") or {}
+        profile_skills = profile.get("skills") or {}
+        final_skills = {}
+        for key in ALWAYS_SHOW_SKILLS:
+            vals = cv_skills.get(key) or profile_skills.get(key) or []
+            if vals:
+                final_skills[key] = vals
+        for key in CONDITIONAL_SKILLS:
+            vals = cv_skills.get(key) or []
+            if vals:
+                final_skills[key] = vals
+        if final_skills:
             cls._section_header(doc, "Technical Skills")
-            cls._skills_table(doc, skills)
+            cls._skills_table(doc, final_skills)
 
         volunteering = cv_data.get("volunteering") or []
         if volunteering:
@@ -950,7 +978,7 @@ UNIFIED_SYSTEM = (
     "\"experience\":[{\"title\":\"\",\"company\":\"\","
     "\"start_date\":\"\",\"end_date\":\"\",\"bullets\":[]}],"
     "\"projects\":[{\"name\":\"\",\"technologies\":[],\"bullets\":[]}],"
-    "\"skills\":{same category keys as profile; items verbatim},"
+    "\"skills\":{JD-relevant categories only; items verbatim — see SKILLS SECTION RULES},"
     "\"volunteering\":[{\"role\":\"\",\"organization\":\"\","
     "\"start_date\":\"\",\"end_date\":\"\",\"bullets\":[]}],"
     "\"achievements\":[verbatim from profile],"
@@ -965,7 +993,17 @@ UNIFIED_SYSTEM = (
     "- Max 3 bullets per project entry (most JD-relevant first)\n"
     "- Use verbatim skills/achievements from profile — never modify\n"
     "- Mirror JD keywords using real profile content only\n"
-    "- Fit: green=70+, yellow=40-69, red=0-39. Be strict."
+    "- Fit: green=70+, yellow=40-69, red=0-39. Be strict.\n"
+    "- SKILLS SECTION RULES:\n"
+    "  Always include these core categories (verbatim from profile): "
+    "languages, frontend, backend, databases, cloud, ai_integrations, "
+    "third_party_apis\n"
+    "  Include these ONLY if the JD explicitly mentions or clearly implies "
+    "them (e.g. 'Excel'/'spreadsheets' → productivity_tools; "
+    "'Figma'/'design' → design_collaboration): "
+    "erp, desktop_gui, productivity_tools, design_collaboration, "
+    "analytics_tools, dev_tools, soft_skills, languages_spoken\n"
+    "  Never include a conditional category just to pad the CV"
 )
 
 
