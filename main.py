@@ -58,6 +58,122 @@ GREEN = "#238636"
 YELLOW = "#9e6a03"
 RED = "#da3633"
 
+DARK_STYLESHEET = """
+QMainWindow, QWidget { background-color: #0d1117; color: #e6edf3; }
+QTabWidget::pane { border: 1px solid #21262d; background-color: #0d1117; }
+QTabBar::tab {
+    background-color: #161b22; color: #8b949e;
+    padding: 8px 16px; border: 1px solid #21262d; border-bottom: none;
+}
+QTabBar::tab:selected {
+    background-color: #0d1117; color: #e6edf3;
+    border-bottom: 2px solid #2ea44f;
+}
+QTextEdit, QPlainTextEdit {
+    background-color: #161b22; color: #e6edf3;
+    border: 1px solid #30363d; border-radius: 6px; padding: 8px;
+    selection-background-color: #1f6feb; selection-color: #ffffff;
+}
+QLineEdit {
+    background-color: #161b22; color: #e6edf3;
+    border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px;
+}
+QPushButton {
+    background-color: #21262d; color: #e6edf3;
+    border: 1px solid #30363d; border-radius: 6px;
+    padding: 6px 16px; font-weight: 600;
+}
+QPushButton:hover { background-color: #30363d; border-color: #8b949e; }
+QPushButton:disabled { color: #6e7681; }
+QPushButton#primary { background-color: #2ea44f; color: #ffffff; border-color: #2ea44f; }
+QPushButton#primary:hover { background-color: #3fb950; }
+QPushButton#danger { background-color: #da3633; color: #ffffff; border-color: #da3633; }
+QProgressBar {
+    background-color: #21262d; border: none; border-radius: 3px;
+    text-align: center; color: #e6edf3;
+}
+QProgressBar::chunk { background-color: #388bfd; border-radius: 3px; }
+QTableWidget {
+    background-color: #161b22; color: #e6edf3;
+    gridline-color: #21262d; border: 1px solid #21262d;
+}
+QTableWidget::item:selected { background-color: #1f6feb; }
+QListWidget {
+    background-color: #161b22; color: #e6edf3; border: 1px solid #30363d;
+}
+QListWidget::item:selected { background-color: #1f6feb; }
+QHeaderView::section {
+    background-color: #21262d; color: #8b949e;
+    border: none; padding: 6px; font-weight: 600;
+}
+QScrollBar:vertical { background: #0d1117; width: 8px; }
+QScrollBar::handle:vertical { background: #30363d; border-radius: 4px; }
+QLabel { color: #e6edf3; }
+QGroupBox {
+    color: #8b949e; border: 1px solid #21262d;
+    border-radius: 6px; margin-top: 8px; padding-top: 8px;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+"""
+
+LIGHT_STYLESHEET = """
+QMainWindow, QWidget { background-color: #ffffff; color: #1a1a2e; }
+QTabWidget::pane { border: 1px solid #d0d7de; background-color: #ffffff; }
+QTabBar::tab {
+    background-color: #f6f8fa; color: #57606a;
+    padding: 8px 16px; border: 1px solid #d0d7de; border-bottom: none;
+}
+QTabBar::tab:selected {
+    background-color: #ffffff; color: #1a1a2e;
+    border-bottom: 2px solid #2ea44f;
+}
+QTextEdit, QPlainTextEdit {
+    background-color: #f6f8fa; color: #1a1a2e;
+    border: 1px solid #d0d7de; border-radius: 6px; padding: 8px;
+    selection-background-color: #0969da; selection-color: #ffffff;
+}
+QLineEdit {
+    background-color: #ffffff; color: #1a1a2e;
+    border: 1px solid #d0d7de; border-radius: 6px; padding: 6px 10px;
+}
+QPushButton {
+    background-color: #f6f8fa; color: #1a1a2e;
+    border: 1px solid #d0d7de; border-radius: 6px;
+    padding: 6px 16px; font-weight: 600;
+}
+QPushButton:hover { background-color: #eaeef2; border-color: #8c959f; }
+QPushButton:disabled { color: #8c959f; }
+QPushButton#primary { background-color: #2ea44f; color: #ffffff; border-color: #2ea44f; }
+QPushButton#primary:hover { background-color: #3fb950; }
+QPushButton#danger { background-color: #da3633; color: #ffffff; border-color: #da3633; }
+QProgressBar {
+    background-color: #eaeef2; border: none; border-radius: 3px;
+    text-align: center; color: #1a1a2e;
+}
+QProgressBar::chunk { background-color: #2ea44f; border-radius: 3px; }
+QTableWidget {
+    background-color: #ffffff; color: #1a1a2e;
+    gridline-color: #d0d7de; border: 1px solid #d0d7de;
+}
+QTableWidget::item:selected { background-color: #0969da; color: #ffffff; }
+QListWidget {
+    background-color: #f6f8fa; color: #1a1a2e; border: 1px solid #d0d7de;
+}
+QListWidget::item:selected { background-color: #0969da; color: #ffffff; }
+QHeaderView::section {
+    background-color: #f6f8fa; color: #57606a;
+    border: none; padding: 6px; font-weight: 600;
+}
+QScrollBar:vertical { background: #f6f8fa; width: 8px; }
+QScrollBar::handle:vertical { background: #d0d7de; border-radius: 4px; }
+QLabel { color: #1a1a2e; }
+QGroupBox {
+    color: #57606a; border: 1px solid #d0d7de;
+    border-radius: 6px; margin-top: 8px; padding-top: 8px;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+"""
+
 PROFILE_SCHEMA = {
     "name": "", "contact": {"email": "", "phone": "", "linkedin": "",
                             "github": "", "website": ""},
@@ -128,6 +244,7 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 disk = json.load(f)
             cfg["output_folder"] = disk.get("output_folder") or DEFAULT_OUTPUT
+            cfg["theme"] = disk.get("theme", "dark")
             legacy_key = (disk.get("api_key") or "").strip()
             if legacy_key:
                 _set_api_key_in_keyring(legacy_key)
@@ -147,7 +264,8 @@ def load_config():
 def save_config(cfg):
     """Persist non-secret config to disk; persist API key to OS keyring."""
     _set_api_key_in_keyring((cfg.get("api_key") or "").strip())
-    on_disk = {"output_folder": cfg.get("output_folder") or DEFAULT_OUTPUT}
+    on_disk = {"output_folder": cfg.get("output_folder") or DEFAULT_OUTPUT,
+               "theme": cfg.get("theme", "dark")}
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(on_disk, f, indent=2)
 
@@ -1121,6 +1239,18 @@ class ProfileBuildWorker(QThread):
             self.error.emit(str(e))
 
 
+# ─── Plain-text paste widget ─────────────────────────────────────────────
+
+class PlainTextEdit(QTextEdit):
+    """QTextEdit that always pastes as plain text, stripping clipboard formatting."""
+
+    def insertFromMimeData(self, source):
+        if source.hasText():
+            self.insertPlainText(source.text())
+        else:
+            super().insertFromMimeData(source)
+
+
 # ─── Tabs ────────────────────────────────────────────────────────────────
 
 class SettingsTab(QWidget):
@@ -1167,10 +1297,27 @@ class SettingsTab(QWidget):
         save_row.addStretch()
         layout.addLayout(save_row)
 
+        layout.addSpacing(15)
+        theme_lbl = QLabel("Appearance")
+        layout.addWidget(theme_lbl)
+        theme = cfg.get("theme", "dark")
+        self.theme_btn = QPushButton(
+            "☀️ Light Mode" if theme == "dark" else "🌙 Dark Mode")
+        self.theme_btn.clicked.connect(self._toggle_theme)
+        layout.addWidget(self.theme_btn)
+
         layout.addStretch()
         ver = QLabel(f"CV Tailor v{APP_VERSION}")
         ver.setStyleSheet("color:#8b949e;")
         layout.addWidget(ver)
+
+    def _toggle_theme(self):
+        """Toggle between dark and light theme and persist the choice."""
+        self.cfg["theme"] = "light" if self.cfg.get("theme", "dark") == "dark" else "dark"
+        self.theme_btn.setText(
+            "☀️ Light Mode" if self.cfg["theme"] == "dark" else "🌙 Dark Mode")
+        save_config(self.cfg)
+        self.config_changed.emit()
 
     def _toggle_show(self, checked):
         """Toggle API key visibility."""
@@ -1381,7 +1528,7 @@ class SingleJobTab(QWidget):
         v.addLayout(form)
 
         v.addWidget(QLabel("Paste the full job description here:"))
-        self.jd = QTextEdit()
+        self.jd = PlainTextEdit()
         self.jd.textChanged.connect(self._update_state)
         v.addWidget(self.jd)
         self.charlbl = QLabel("0 characters")
@@ -1731,7 +1878,7 @@ class BulkTab(QWidget):
             "[full job description here]\n---")
         v.addWidget(self.instructions)
 
-        self.input = QTextEdit()
+        self.input = PlainTextEdit()
         self.input.textChanged.connect(self._update_count)
         v.addWidget(self.input)
 
@@ -1989,6 +2136,7 @@ class MainWindow(QMainWindow):
     def _on_config(self):
         """Re-create client after settings change."""
         self._client = None
+        self._apply_theme()
         self._refresh_banner()
 
     def _refresh_banner(self):
@@ -2002,42 +2150,10 @@ class MainWindow(QMainWindow):
             self.banner.setVisible(False)
 
     def _apply_theme(self):
-        """Apply dark theme stylesheet."""
-        self.setStyleSheet(f"""
-            QMainWindow, QWidget {{ background:{BG}; color:{FG}; }}
-            QTabWidget::pane {{ border:1px solid {BORDER}; }}
-            QTabBar::tab {{
-                background:{PANEL}; color:{FG};
-                padding:8px 20px; border:1px solid {BORDER};
-            }}
-            QTabBar::tab:selected {{ background:{BG}; border-bottom:none; }}
-            QLineEdit, QTextEdit, QListWidget, QTableWidget, QComboBox {{
-                background:{PANEL}; color:{FG}; border:1px solid {BORDER};
-                padding:4px; selection-background-color:{ACCENT};
-            }}
-            QPushButton {{
-                background:{PANEL}; color:{FG}; border:1px solid {BORDER};
-                padding:6px 14px; border-radius:3px;
-            }}
-            QPushButton:hover {{ background:#21262d; }}
-            QPushButton:disabled {{ color:#6e7681; }}
-            QGroupBox {{
-                border:1px solid {BORDER}; margin-top:8px; padding-top:8px;
-            }}
-            QGroupBox::title {{
-                subcontrol-origin:margin; left:10px; padding:0 4px;
-            }}
-            QProgressBar {{
-                background:{PANEL}; border:1px solid {BORDER};
-                text-align:center; color:{FG};
-            }}
-            QProgressBar::chunk {{ background:{ACCENT}; }}
-            QHeaderView::section {{
-                background:{PANEL}; color:{FG}; padding:4px;
-                border:1px solid {BORDER};
-            }}
-            QLabel {{ color:{FG}; }}
-        """)
+        """Apply theme stylesheet based on saved config."""
+        theme = self.cfg.get("theme", "dark")
+        QApplication.instance().setStyleSheet(
+            DARK_STYLESHEET if theme == "dark" else LIGHT_STYLESHEET)
 
 
 def main():
