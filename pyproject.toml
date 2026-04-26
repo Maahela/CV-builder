@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cv-tailor"
+version = "1.1.0"
+description = "Desktop app that tailors CVs to job descriptions via Claude."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Maahela" }]
+dependencies = [
+    "PyQt5==5.15.10",
+    "anthropic>=0.40.0",
+    "python-docx==1.1.2",
+    "pdfplumber==0.11.0",
+    "keyring==25.2.1",
+]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0"]
+
+[project.gui-scripts]
+cv-tailor = "cv_tailor.gui.main_window:main"
+
+[tool.setuptools.packages.find]
+include = ["cv_tailor*"]
+exclude = ["output*", "tests*"]
