@@ -532,19 +532,72 @@ def safe_merge_profiles(old, new):
 
 # ─── Claude call wrapper with parse-retry + rate-limit retry ─────────────
 
-def _log_usage(msg, text):
-    """Emit token + cache stats when DEBUG_CV is on."""
-    if not DEBUG_CV:
-        return
+_session_stats = {
+    "jobs": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_cost": 0.0,
+}
+
+
+def reset_session_stats():
+    """Reset all session-level token counters to zero."""
+    _session_stats.update({"jobs": 0, "input_tokens": 0, "output_tokens": 0,
+                           "cache_read_tokens": 0, "total_cost": 0.0})
+
+
+def print_session_summary():
+    """Print cumulative token + cost summary for the current bulk session."""
+    s = _session_stats
+    jobs = max(s["jobs"], 1)
+    print(f"\n{'='*50}")
+    print(f"[SESSION SUMMARY]")
+    print(f"  Jobs processed:      {s['jobs']}")
+    print(f"  Total input tokens:  {s['input_tokens']}")
+    print(f"  Total output tokens: {s['output_tokens']}")
+    print(f"  Total cache reads:   {s['cache_read_tokens']}")
+    print(f"  Total cost:          ${s['total_cost']:.4f}")
+    print(f"  Avg cost per CV:     ${s['total_cost']/jobs:.4f}")
+    print(f"  Cache hit rate:      {s['cache_read_tokens']/(s['input_tokens'] or 1)*100:.1f}%")
+    print(f"{'='*50}\n")
+
+
+def _log_usage(msg, text, call_name="unknown"):
+    """Print per-call token audit and accumulate into session stats."""
     u = msg.usage
     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
     cr = getattr(u, "cache_read_input_tokens", 0) or 0
-    print(f"[DEBUG] in={u.input_tokens} out={u.output_tokens} "
-          f"cache_created={cc} cache_read={cr} "
-          f"chars={len(text)} preview={text[:200]!r}")
+
+    cost_in = (u.input_tokens * 3) / 1_000_000
+    cost_out = (u.output_tokens * 15) / 1_000_000
+    cost_cache = (cr * 0.30) / 1_000_000
+    total_cost = cost_in + cost_out + cost_cache
+
+    print(f"\n{'='*50}")
+    print(f"[TOKEN AUDIT] Call: {call_name}")
+    print(f"  Input tokens:        {u.input_tokens}")
+    print(f"  Output tokens:       {u.output_tokens}")
+    print(f"  Cache created:       {cc}")
+    print(f"  Cache read:          {cr}")
+    print(f"  Effective input:     {u.input_tokens - cr} (non-cached)")
+    print(f"  Estimated cost:      ${total_cost:.6f}")
+    if cr > 0:
+        cache_status = "YES ✓ — reading from cache"
+    elif cc > 0:
+        cache_status = "POPULATING — cache created, next call will be cheaper"
+    else:
+        cache_status = "NO ✗ — cache not working, check cache_control setup"
+    print(f"  Cache status:        {cache_status}")
+    print(f"{'='*50}\n")
+
+    _session_stats["input_tokens"] += u.input_tokens
+    _session_stats["output_tokens"] += u.output_tokens
+    _session_stats["cache_read_tokens"] += cr
+    _session_stats["total_cost"] += total_cost
 
 
-def claude_call(client, system, user, max_tokens, retries=1):
+def claude_call(client, system, user, max_tokens, retries=1, call_name="unknown"):
     """Call Anthropic once, retrying on RateLimit once. Returns raw text."""
     last_err = None
     for _ in range(retries + 2):
@@ -553,7 +606,7 @@ def claude_call(client, system, user, max_tokens, retries=1):
                 model=MODEL_NAME, max_tokens=max_tokens, system=system,
                 messages=[{"role": "user", "content": user}])
             text = msg.content[0].text
-            _log_usage(msg, text)
+            _log_usage(msg, text, call_name)
             return text
         except RateLimitError as e:
             last_err = e
@@ -563,7 +616,7 @@ def claude_call(client, system, user, max_tokens, retries=1):
 
 
 def claude_call_cached(client, system, cached_user, fresh_user,
-                       max_tokens, retries=1):
+                       max_tokens, retries=1, call_name="unknown"):
     """Like claude_call, but marks system + cached_user for prompt caching.
 
     Cached blocks cost 10% of the normal input rate on a cache-hit and
@@ -594,7 +647,7 @@ def claude_call_cached(client, system, cached_user, fresh_user,
                 }],
             )
             text = msg.content[0].text
-            _log_usage(msg, text)
+            _log_usage(msg, text, call_name)
             return text
         except RateLimitError as e:
             last_err = e
@@ -637,7 +690,8 @@ class ProfileManager:
             "- Skills must use the category keys in the schema exactly.\n\n"
             "SCHEMA: " + schema_str
         )
-        text = claude_call(self.client, system, combined, MAX_TOKENS_PROFILE)
+        text = claude_call(self.client, system, combined, MAX_TOKENS_PROFILE,
+                           call_name="profile_build")
         return parse_json_response(text)
 
     def merge(self, existing, texts):
@@ -655,7 +709,8 @@ class ProfileManager:
             "JSON only, no fences."
         )
         user = f"EXISTING:{compact}\n\nNEW:\n{combined}"
-        text = claude_call(self.client, system, user, MAX_TOKENS_PROFILE)
+        text = claude_call(self.client, system, user, MAX_TOKENS_PROFILE,
+                           call_name="profile_merge")
         merged = parse_json_response(text)
         return safe_merge_profiles(existing, merged)
 
@@ -1165,7 +1220,8 @@ class UnifiedWorker(QThread):
         try:
             text = claude_call_cached(self.client, UNIFIED_SYSTEM,
                                       cached_user, fresh_user,
-                                      MAX_TOKENS_UNIFIED)
+                                      MAX_TOKENS_UNIFIED,
+                                      call_name="fit_and_cv_generation")
             self.progress.emit(80)
             data = self._parse(text)
             fit = data.get("fit") or {}
@@ -1202,6 +1258,7 @@ class UnifiedWorker(QThread):
             UNIFIED_SYSTEM + retry_suffix,
             cached_user, fresh_user,
             MAX_TOKENS_UNIFIED,
+            call_name="fit_and_cv_generation (retry)",
         )
         body2, _ = strip_hard_gap(text2)
         try:
@@ -1759,6 +1816,7 @@ class BulkRunner(QThread):
 
     def run(self):
         """Main loop."""
+        reset_session_stats()
         for i, (company, title, jd) in enumerate(self.jobs):
             if self._stop:
                 break
@@ -1820,7 +1878,9 @@ class BulkRunner(QThread):
                 self.row_update.emit(i, "Status", f"✗ Error: {e}")
                 row_result["Status"] = f"Error: {e}"
             self.results.append(row_result)
+            _session_stats["jobs"] += 1
             time.sleep(BULK_DELAY_SEC)
+        print_session_summary()
         self.done.emit()
 
     def _unified(self, company, title, jd):
@@ -1834,7 +1894,8 @@ class BulkRunner(QThread):
         try:
             text = claude_call_cached(self.client, UNIFIED_SYSTEM,
                                       cached_user, fresh_user,
-                                      MAX_TOKENS_UNIFIED)
+                                      MAX_TOKENS_UNIFIED,
+                                      call_name="fit_and_cv_generation")
             body, _ = strip_hard_gap(text)
             data = parse_json_response(body)
             return (data.get("fit") or {},
@@ -1854,7 +1915,8 @@ class BulkRunner(QThread):
             try:
                 text = claude_call_cached(
                     self.client, UNIFIED_SYSTEM + retry_suffix,
-                    cached_user, fresh_user, MAX_TOKENS_UNIFIED)
+                    cached_user, fresh_user, MAX_TOKENS_UNIFIED,
+                    call_name="fit_and_cv_generation (retry)")
                 body, _ = strip_hard_gap(text)
                 data = parse_json_response(body)
                 return (data.get("fit") or {},
