@@ -322,9 +322,8 @@ def sanitize_filename_part(text, maxlen):
 def build_output_path(output_folder, company, title):
     """Return non-colliding output path for today's CV."""
     os.makedirs(output_folder, exist_ok=True)
-    date = datetime.now().strftime("%Y-%m-%d")
-    base = f"{date}_{sanitize_filename_part(company, COMPANY_MAX)}_" \
-           f"{sanitize_filename_part(title, TITLE_MAX)}"
+    base = (f"{sanitize_filename_part(company, COMPANY_MAX)}_"
+            f"{sanitize_filename_part(title, TITLE_MAX)}")
     path = os.path.join(output_folder, base + ".docx")
     i = 2
     while os.path.exists(path):
