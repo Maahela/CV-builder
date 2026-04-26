@@ -1128,7 +1128,14 @@ UNIFIED_SYSTEM = (
     "  Never include a conditional category just to pad the CV\n"
     "- EXPERIENCE FILTERING: Omit the 'Freelance Video Editor' (Fiverr) role "
     "from experience UNLESS the JD explicitly involves video editing, "
-    "content creation, multimedia production, or Adobe Creative Suite work."
+    "content creation, multimedia production, or Adobe Creative Suite work.\n"
+    "- TRANSFERABLE FRAMING RULE: The profile includes a transferable_framing "
+    "dictionary. When the JD mentions a requirement that seems like a gap, "
+    "check this dictionary first. If relevant evidence exists, weave it "
+    "naturally into the summary or the most relevant experience/project "
+    "bullets. Do not copy the framing text verbatim — rewrite it to fit the "
+    "context naturally. This is not fabrication — it is accurate reframing "
+    "of real experience."
 )
 
 
