@@ -192,7 +192,8 @@ ALWAYS_SHOW_SKILLS = [
 
 CONDITIONAL_SKILLS = [
     "erp", "desktop_gui", "productivity_tools", "design_collaboration",
-    "analytics_tools", "dev_tools", "soft_skills", "languages_spoken",
+    "analytics_tools", "dev_tools", "creative_media",
+    "soft_skills", "languages_spoken",
 ]
 
 SKILL_LABELS = {
@@ -203,6 +204,7 @@ SKILL_LABELS = {
     "desktop_gui": "Desktop / GUI", "productivity_tools": "Productivity",
     "design_collaboration": "Design & Collab",
     "analytics_tools": "Analytics", "dev_tools": "Dev Tools",
+    "creative_media": "Creative & Media",
     "soft_skills": "Soft Skills", "languages_spoken": "Languages Spoken",
 }
 
@@ -1118,10 +1120,15 @@ UNIFIED_SYSTEM = (
     "third_party_apis\n"
     "  Include these ONLY if the JD explicitly mentions or clearly implies "
     "them (e.g. 'Excel'/'spreadsheets' → productivity_tools; "
-    "'Figma'/'design' → design_collaboration): "
+    "'Figma'/'design' → design_collaboration; "
+    "'video editing'/'Premiere'/'Photoshop'/'content creation'/'multimedia' "
+    "→ creative_media): "
     "erp, desktop_gui, productivity_tools, design_collaboration, "
-    "analytics_tools, dev_tools, soft_skills, languages_spoken\n"
-    "  Never include a conditional category just to pad the CV"
+    "analytics_tools, dev_tools, creative_media, soft_skills, languages_spoken\n"
+    "  Never include a conditional category just to pad the CV\n"
+    "- EXPERIENCE FILTERING: Omit the 'Freelance Video Editor' (Fiverr) role "
+    "from experience UNLESS the JD explicitly involves video editing, "
+    "content creation, multimedia production, or Adobe Creative Suite work."
 )
 
 
