@@ -22,6 +22,7 @@ The intended user is a job seeker who applies to many roles and wants profession
 | Document generation | `python-docx 1.1.2` |
 | PDF parsing | `pdfplumber 0.11.0` |
 | Credential storage | `keyring 25.2.1` (OS-native keychain) |
+| Spreadsheet output | `openpyxl >= 3.1.0` (job application tracker) |
 | Document format | `.docx` (A4, Calibri, 2 cm margins) |
 
 ---
@@ -37,7 +38,9 @@ The intended user is a job seeker who applies to many roles and wants profession
 - **Profile compression** — empty fields are stripped and common JSON keys are abbreviated before being sent to Claude, reducing input token count.
 - **Formatted DOCX output** — generates a polished A4 CV with Calibri font, right-aligned date tabs, bottom-bordered section headers, a borderless two-column skills table, and clickable hyperlinks for LinkedIn/GitHub/portfolio URLs.
 - **Secure key storage** — the Anthropic API key is stored in the OS-native keyring (Windows Credential Manager / macOS Keychain), never written to disk. Legacy plaintext keys found in `config.json` are migrated and scrubbed on first load.
-- **CSV export** — bulk runs can be exported to a structured CSV with fit scores, summaries, strengths, gaps, and output filenames for each job.
+- **Job application tracker** — every successful generation appends a row to `job_applications.xlsx` in the output folder, with date, company, role, fit, score, summary, hard-gap flag, and CV filename. Subsequent rows can be tagged with status (`Applied`, `Phone Screen`, `Offer`, `Rejected`, etc.) via an Excel dropdown, and the dedicated **Tracker** tab in the app shows totals for Active / Interviews / Offers / Rejected.
+- **Duplicate detection** — before generating, the app checks the tracker for an existing application matching the same company and role, and prompts the user to confirm before producing a second CV.
+- **CSV export** — the tracker can be exported to a dated CSV (`job_applications_YYYY-MM-DD.csv`) for analysis or backup.
 
 ---
 
@@ -54,6 +57,7 @@ cv_tailor/
 ├── extract.py         # PDF/DOCX/TXT text extraction
 ├── profile.py         # Master profile CRUD, compression, validation
 ├── prompts.py         # Claude system prompts
+├── tracker.py         # Job application tracker (xlsx + CSV export)
 ├── utils.py           # Filename sanitization, JSON parsing, path helpers
 ├── workers.py         # QThread subclasses for non-blocking API calls
 └── gui/
@@ -62,6 +66,7 @@ cv_tailor/
     ├── bulk_tab.py        # Bulk job processing UI
     ├── profile_tab.py     # Profile upload & extraction UI
     ├── profile_editor.py  # Profile editing widgets
+    ├── tracker_tab.py     # Application tracker view + summary stats
     ├── settings_tab.py    # API key + output folder settings
     ├── styles.py          # Light/dark theme stylesheets
     └── widgets.py         # Custom Qt widgets
@@ -97,6 +102,10 @@ CV documents (PDF/DOCX/TXT)
         │
         ▼
   output/<Company>_<Title>.docx
+        │
+        ▼
+  tracker.write_tracker_row()
+  (appends to output/job_applications.xlsx)
 ```
 
 **Threading model**: Claude API calls run in `QThread` subclasses (`UnifiedWorker`, `ProfileBuildWorker`, `BulkRunner`) with Qt signals/slots for progress and result delivery, keeping the GUI responsive.
@@ -155,8 +164,9 @@ python tests/test_live.py
 
 1. **Settings tab** — paste your Anthropic API key and click Save.
 2. **Profile tab** — upload your existing CV(s) (PDF/DOCX/TXT) and click **Build New Profile**. Use **Merge Into Profile** to add further documents without losing existing data.
-3. **Single Job tab** — fill Company, Title, paste a JD, click **Assess & Generate CV**. Green/yellow proceeds automatically; red pauses for your decision.
+3. **Single Job tab** — fill Company, Title, paste a JD, click **Assess & Generate CV**. Green/yellow proceeds automatically; red pauses for your decision. If a matching company+role already exists in the tracker, you will be asked to confirm before re-generating.
 4. **Bulk Jobs tab** — paste many JDs at once using the format below and run them sequentially.
+5. **Tracker tab** — view all generated applications, update each row's status, and export to CSV. The xlsx file lives at `output/job_applications.xlsx` and can also be edited directly in Excel.
 
 **Bulk input format** — separate jobs with `---` on its own line:
 
