@@ -6,10 +6,13 @@ import sys
 import tempfile
 import zipfile
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import main  # noqa
 
-with open("master_profile.json", "r", encoding="utf-8") as f:
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.path.join(_root, "master_profile.json"), "r", encoding="utf-8") as f:
     profile = json.load(f)
 
 cv = {k: profile.get(k) for k in

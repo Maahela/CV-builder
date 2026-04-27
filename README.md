@@ -18,7 +18,7 @@ The intended user is a job seeker who applies to many roles and wants profession
 | --- | --- |
 | Language | Python 3 |
 | GUI framework | PyQt5 5.15.10 |
-| AI / LLM | Anthropic Claude (`claude-sonnet-4-5`) via `anthropic >= 0.40.0` |
+| AI / LLM | Anthropic Claude (`claude-sonnet-4-5`) via `anthropic >= 0.40.0` SDK |
 | Document generation | `python-docx 1.1.2` |
 | PDF parsing | `pdfplumber 0.11.0` |
 | Credential storage | `keyring 25.2.1` (OS-native keychain) |
@@ -43,7 +43,31 @@ The intended user is a job seeker who applies to many roles and wants profession
 
 ## Architecture / How It Works
 
-CV Tailor is a single-file, self-contained desktop application (`main.py`, ~2 050 lines). There is no separate frontend/backend split or server.
+CV Tailor is structured as a Python package (`cv_tailor/`) with a thin `main.py` entry point that re-exports the public API. There is no separate frontend/backend split or server.
+
+```text
+cv_tailor/
+├── claude_client.py   # Anthropic API wrapper, session stats, prompt caching
+├── config.py          # Config + keyring I/O
+├── constants.py       # App-wide constants (model, page geometry, schema)
+├── docx_builder.py    # OOXML / .docx rendering pipeline
+├── extract.py         # PDF/DOCX/TXT text extraction
+├── profile.py         # Master profile CRUD, compression, validation
+├── prompts.py         # Claude system prompts
+├── utils.py           # Filename sanitization, JSON parsing, path helpers
+├── workers.py         # QThread subclasses for non-blocking API calls
+└── gui/
+    ├── main_window.py     # Application shell + tab container
+    ├── single_job_tab.py  # Single-job CV generation UI
+    ├── bulk_tab.py        # Bulk job processing UI
+    ├── profile_tab.py     # Profile upload & extraction UI
+    ├── profile_editor.py  # Profile editing widgets
+    ├── settings_tab.py    # API key + output folder settings
+    ├── styles.py          # Light/dark theme stylesheets
+    └── widgets.py         # Custom Qt widgets
+```
+
+**Data flow:**
 
 ```text
 CV documents (PDF/DOCX/TXT)
@@ -72,7 +96,7 @@ CV documents (PDF/DOCX/TXT)
   (renders tailored JSON → formatted .docx)
         │
         ▼
-  output/<date>_<Company>_<Title>.docx
+  output/<Company>_<Title>.docx
 ```
 
 **Threading model**: Claude API calls run in `QThread` subclasses (`UnifiedWorker`, `ProfileBuildWorker`, `BulkRunner`) with Qt signals/slots for progress and result delivery, keeping the GUI responsive.
@@ -118,13 +142,13 @@ On first launch, go to the **Settings** tab and enter your Anthropic API key (mu
 
 ```bash
 # Unit + DOCX build tests — no API key required
-python test_smoke.py
+python tests/test_smoke.py
 
 # DOCX render test against the real master profile — requires master_profile.json
-python test_real_profile.py
+python tests/test_real_profile.py
 
 # End-to-end live API test — requires a configured API key
-python test_live.py
+python tests/test_live.py
 ```
 
 **Usage workflow:**
@@ -149,7 +173,7 @@ JD:
 ---
 ```
 
-Generated `.docx` files are saved to `./output/` by default (configurable in Settings) with filenames following `YYYY-MM-DD_Company_JobTitle.docx`.
+Generated `.docx` files are saved to `./output/` by default (configurable in Settings) with filenames following `Company_JobTitle.docx`.
 
 ---
 
@@ -174,9 +198,8 @@ The core loop (profile extraction → fit assessment → CV generation → DOCX 
 
 **Incomplete or absent areas:**
 
-- No packaging or installer (`pyproject.toml`, `setup.py`, or standalone executable).
+- No standalone installer — `pyproject.toml` and `cv_tailor.spec` (PyInstaller) are present but a packaged executable has not been published.
 - No deployment configuration (no Docker, no CI/CD pipeline).
-- Windows-specific file-opening (`os.startfile`, `notepad.exe`); not cross-platform.
 - No profile editing UI — the master profile JSON must be edited manually if corrections are needed.
 
 ---
