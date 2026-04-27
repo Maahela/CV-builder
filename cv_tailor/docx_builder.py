@@ -151,7 +151,7 @@ class DocxBuilder:
             doc.paragraphs[-1].paragraph_format.space_after = Pt(6)
 
     @staticmethod
-    def _add_hyperlink(paragraph, text, url):
+    def _add_hyperlink(paragraph, text, url, size=10):
         """Append a blue underlined clickable hyperlink run to a paragraph."""
         r_id = paragraph.part.relate_to(
             url,
@@ -174,7 +174,7 @@ class DocxBuilder:
         fonts.set(qn("w:hAnsi"), "Calibri")
         rPr.append(fonts)
         sz = OxmlElement("w:sz")
-        sz.set(qn("w:val"), "20")  # 10pt = 20 half-points
+        sz.set(qn("w:val"), str(int(size * 2)))  # half-points
         rPr.append(sz)
         run.append(rPr)
         t = OxmlElement("w:t")
@@ -318,7 +318,14 @@ class DocxBuilder:
                     print(f"[warn] empty bullets for role: {role.get('title')}")
                 cls._bullets(doc, bullets)
 
+        def _norm(s):
+            return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
         projects = cv_data.get("projects") or []
+        profile_proj_links = {
+            _norm(p.get("name", "")): (p.get("link") or "").strip()
+            for p in (profile.get("projects") or [])
+        }
         if projects:
             cls._section_header(doc, "Projects")
             for proj in projects:
@@ -326,20 +333,20 @@ class DocxBuilder:
                     proj.get("start_date"), proj.get("end_date"),
                     None) or str(proj.get("year") or "")
                 proj_name = proj.get("name", "")
-                proj_link = (proj.get("link") or "").strip()
-                title_p = cls._title_with_date(doc, proj_name, date_str)
-                if proj_link and proj_link.lower() != "github":
-                    url = proj_link if proj_link.startswith("http") \
-                        else f"https://{proj_link}"
-                    title_p.add_run("  ")
-                    cls._add_hyperlink(title_p, proj_link, url)
-                elif proj_link.lower() == "github":
-                    cls._add_run(title_p, "  GitHub", size=10, color="555555")
+                proj_link = (proj.get("link") or "").strip() \
+                    or profile_proj_links.get(_norm(proj_name), "")
+                cls._title_with_date(doc, proj_name, date_str)
                 tech = proj.get("technologies") or proj.get("tech") or []
                 if isinstance(tech, list):
                     tech = ", ".join(tech)
                 if tech:
                     cls._subline(doc, tech)
+                if proj_link.startswith("https://"):
+                    p_link = doc.add_paragraph()
+                    p_link.paragraph_format.space_before = Pt(0)
+                    p_link.paragraph_format.space_after = Pt(2)
+                    cls._add_run(p_link, "GitHub: ", size=9, color="1155CC")
+                    cls._add_hyperlink(p_link, proj_link, proj_link, size=9)
                 bullets = proj.get("highlights") or proj.get("bullets") or []
                 if not bullets:
                     desc = proj.get("description") or ""
