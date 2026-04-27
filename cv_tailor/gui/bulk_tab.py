@@ -25,6 +25,7 @@ class BulkTab(QWidget):
         self.get_client = get_client
         self.get_profile = get_profile
         self.get_output = get_output
+        self.tracker_updated_cb = None
         self.runner = None
         self.pending_rows = {}
 
@@ -118,6 +119,9 @@ class BulkTab(QWidget):
         self.runner = BulkRunner(client, profile, self.get_output(), jobs)
         self.runner.row_update.connect(self._on_row)
         self.runner.waiting_for_decision.connect(self._on_red)
+        self.runner.duplicate_found.connect(self._on_duplicate)
+        if self.tracker_updated_cb:
+            self.runner.tracker_updated.connect(self.tracker_updated_cb)
         self.runner.done.connect(self._on_done)
         self.runner.start()
 
@@ -169,6 +173,18 @@ class BulkTab(QWidget):
         h.addWidget(skp)
         self.table.setCellWidget(row, 4, w)
         self.pending_rows[row] = w
+
+    def _on_duplicate(self, row, company, role, prev_date):
+        """Prompt user about duplicate; relay decision to runner."""
+        ans = QMessageBox.question(
+            self, "Possible Duplicate",
+            f"You may have already applied to this role.\n"
+            f"{company} — {role} was applied to on {prev_date}.\n\n"
+            f"Add another entry anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if self.runner:
+            self.runner.submit_duplicate_decision(
+                "add" if ans == QMessageBox.Yes else "skip")
 
     def _decide(self, row, choice):
         """Deliver user's RED decision to the runner."""

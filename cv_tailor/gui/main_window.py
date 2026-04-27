@@ -13,6 +13,7 @@ from .profile_tab import ProfileTab
 from .settings_tab import SettingsTab
 from .single_job_tab import SingleJobTab
 from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
+from .tracker_tab import TrackerTab
 
 
 class MainWindow(QMainWindow):
@@ -58,13 +59,25 @@ class MainWindow(QMainWindow):
         self.bulk_tab = BulkTab(
             self._get_client, lambda: self.profile,
             lambda: self.cfg.get("output_folder", DEFAULT_OUTPUT))
+        self.tracker_tab = TrackerTab(
+            lambda: self.cfg.get("output_folder", DEFAULT_OUTPUT))
+
+        self.single_tab.tracker_updated = self.tracker_tab.refresh
+        self.bulk_tab.tracker_updated_cb = self.tracker_tab.refresh
 
         self.tabs.addTab(self.settings_tab, "Settings")
         self.tabs.addTab(self.profile_tab, "Profile")
         self.tabs.addTab(self.single_tab, "Single Job")
         self.tabs.addTab(self.bulk_tab, "Bulk Jobs")
+        self.tabs.addTab(self.tracker_tab, "Tracker")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         v.addWidget(self.tabs)
         self.setCentralWidget(container)
+
+    def _on_tab_changed(self, idx):
+        """Refresh tracker when its tab is shown."""
+        if self.tabs.widget(idx) is self.tracker_tab:
+            self.tracker_tab.refresh()
 
     def _get_client(self):
         """Return or create the Anthropic client."""

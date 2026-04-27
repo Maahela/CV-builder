@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (QFormLayout, QHBoxLayout, QLabel, QLineEdit,
 
 from ..constants import GREEN, RED, YELLOW
 from ..docx_builder import DocxBuilder
+from ..tracker import find_existing_application, write_tracker_row
 from ..utils import build_output_path, open_file_native
 from ..workers import UnifiedWorker
 from .widgets import PlainTextEdit
@@ -174,7 +175,7 @@ class SingleJobTab(QWidget):
         if not self._cached:
             self.go_btn.setEnabled(True)
             return
-        _, cv, hard_gap = self._cached
+        fit, cv, hard_gap = self._cached
         try:
             profile = self.get_profile()
             self.output_path = build_output_path(self.get_output(),
@@ -186,6 +187,7 @@ class SingleJobTab(QWidget):
                 f"Generated: {os.path.basename(self.output_path)}")
             self.open_file_btn.setVisible(True)
             self.open_folder_btn.setVisible(True)
+            self._record_to_tracker(fit, hard_gap)
             if hard_gap:
                 self.gap_banner.setText(f"⚠ Hard gap: {hard_gap}")
                 self.gap_banner.setStyleSheet(
@@ -195,6 +197,37 @@ class SingleJobTab(QWidget):
         except Exception as e:
             self._on_error(f"DOCX build failed: {e}")
         self.go_btn.setEnabled(True)
+
+    def _record_to_tracker(self, fit, hard_gap):
+        """Append a row to job_applications.xlsx with duplicate prompt."""
+        company = self.company.text().strip()
+        role = self.title.text().strip()
+        output = self.get_output()
+        existing = find_existing_application(output, company, role)
+        if existing:
+            _, _, prev_date = existing
+            answer = QMessageBox.question(
+                self, "Possible Duplicate",
+                f"You may have already applied to this role.\n"
+                f"{company} — {role} was applied to on {prev_date}.\n\n"
+                f"Add another entry anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        try:
+            write_tracker_row(output, {
+                "company": company,
+                "role": role,
+                "fit": (fit or {}).get("fit", ""),
+                "fit_score": (fit or {}).get("score", ""),
+                "fit_summary": (fit or {}).get("summary", ""),
+                "hard_gap": hard_gap or "",
+                "cv_filename": os.path.basename(self.output_path),
+            })
+            if hasattr(self, "tracker_updated") and self.tracker_updated:
+                self.tracker_updated()
+        except Exception as e:
+            print(f"[tracker] write failed: {e}")
 
     def _on_error(self, msg):
         """Show error state."""

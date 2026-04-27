@@ -15,6 +15,7 @@ from .docx_builder import DocxBuilder
 from .extract import extract_text_from_file
 from .profile import (ProfileManager, compress_profile, validate_cv_output)
 from .prompts import UNIFIED_SYSTEM
+from .tracker import find_existing_application, write_tracker_row
 from .utils import build_output_path, parse_json_response, strip_hard_gap
 
 
@@ -154,6 +155,8 @@ class BulkRunner(QThread):
     per job via UNIFIED_SYSTEM."""
     row_update = pyqtSignal(int, str, str)
     waiting_for_decision = pyqtSignal(int, str, list)
+    duplicate_found = pyqtSignal(int, str, str, str)
+    tracker_updated = pyqtSignal()
     done = pyqtSignal()
 
     def __init__(self, client, profile, output_folder, jobs):
@@ -166,17 +169,25 @@ class BulkRunner(QThread):
         self._stop = False
         self._decision_event = threading.Event()
         self._decision = None
+        self._dup_event = threading.Event()
+        self._dup_decision = None
         self.results = []
 
     def stop(self):
         """Request stop — unblocks any pending decision wait."""
         self._stop = True
         self._decision_event.set()
+        self._dup_event.set()
 
     def submit_decision(self, decision):
         """Called from GUI with 'generate' or 'skip'."""
         self._decision = decision
         self._decision_event.set()
+
+    def submit_duplicate_decision(self, decision):
+        """Called from GUI with 'add' or 'skip' for duplicate prompt."""
+        self._dup_decision = decision
+        self._dup_event.set()
 
     def run(self):
         """Main loop."""
@@ -238,6 +249,8 @@ class BulkRunner(QThread):
                 if hard_gap:
                     self.row_update.emit(i, "Gap", f"⚠ {hard_gap}")
                     row_result["Gap Note"] = hard_gap
+                self._record_to_tracker(i, company, title, fit, hard_gap,
+                                        os.path.basename(path))
             except Exception as e:
                 self.row_update.emit(i, "Status", f"✗ Error: {e}")
                 row_result["Status"] = f"Error: {e}"
@@ -246,6 +259,31 @@ class BulkRunner(QThread):
             time.sleep(BULK_DELAY_SEC)
         print_session_summary()
         self.done.emit()
+
+    def _record_to_tracker(self, row, company, title, fit, hard_gap, fname):
+        """Append a row to job_applications.xlsx, prompting on duplicates."""
+        try:
+            existing = find_existing_application(self.output, company, title)
+            if existing:
+                _, _, prev_date = existing
+                self._dup_event.clear()
+                self._dup_decision = None
+                self.duplicate_found.emit(row, company, title, str(prev_date))
+                self._dup_event.wait()
+                if self._stop or self._dup_decision != "add":
+                    return
+            write_tracker_row(self.output, {
+                "company": company,
+                "role": title,
+                "fit": (fit or {}).get("fit", ""),
+                "fit_score": (fit or {}).get("score", ""),
+                "fit_summary": (fit or {}).get("summary", ""),
+                "hard_gap": hard_gap or "",
+                "cv_filename": fname,
+            })
+            self.tracker_updated.emit()
+        except Exception as e:
+            print(f"[tracker] write failed: {e}")
 
     def _unified(self, company, title, jd):
         """Single combined fit+CV call. Returns (fit, cv, hard_gap) or
