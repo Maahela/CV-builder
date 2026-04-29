@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (QFormLayout, QHBoxLayout, QLabel, QLineEdit,
 from ..constants import GREEN, RED, YELLOW
 from ..docx_builder import DocxBuilder
 from ..tracker import find_existing_application, write_tracker_row
-from ..utils import build_output_path, open_file_native
+from ..utils import build_output_path, open_file_native, save_jd_file
 from ..workers import UnifiedWorker
 from .widgets import PlainTextEdit
 
@@ -182,12 +182,26 @@ class SingleJobTab(QWidget):
                                                  self.company.text(),
                                                  self.title.text())
             DocxBuilder.build(profile, cv, self.output_path)
+            jd_filename = ""
+            try:
+                jd_path = save_jd_file(
+                    self.output_path,
+                    self.company.text().strip(),
+                    self.title.text().strip(),
+                    self.jd.toPlainText(),
+                    fit_label=(fit or {}).get("fit", ""),
+                    fit_score=(fit or {}).get("score", ""),
+                )
+                jd_filename = os.path.relpath(
+                    jd_path, self.get_output()).replace(os.sep, "/")
+            except Exception as e:
+                print(f"[jd] write failed: {e}")
             self.phase_lbl.setText("Done.")
             self.file_lbl.setText(
                 f"Generated: {os.path.basename(self.output_path)}")
             self.open_file_btn.setVisible(True)
             self.open_folder_btn.setVisible(True)
-            self._record_to_tracker(fit, hard_gap)
+            self._record_to_tracker(fit, hard_gap, jd_filename)
             if hard_gap:
                 self.gap_banner.setText(f"⚠ Hard gap: {hard_gap}")
                 self.gap_banner.setStyleSheet(
@@ -198,7 +212,7 @@ class SingleJobTab(QWidget):
             self._on_error(f"DOCX build failed: {e}")
         self.go_btn.setEnabled(True)
 
-    def _record_to_tracker(self, fit, hard_gap):
+    def _record_to_tracker(self, fit, hard_gap, jd_filename=""):
         """Append a row to job_applications.xlsx with duplicate prompt."""
         company = self.company.text().strip()
         role = self.title.text().strip()
@@ -223,6 +237,7 @@ class SingleJobTab(QWidget):
                 "fit_summary": (fit or {}).get("summary", ""),
                 "hard_gap": hard_gap or "",
                 "cv_filename": os.path.basename(self.output_path),
+                "jd_filename": jd_filename,
             })
             if hasattr(self, "tracker_updated") and self.tracker_updated:
                 self.tracker_updated()
