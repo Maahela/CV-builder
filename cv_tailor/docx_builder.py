@@ -238,36 +238,19 @@ class DocxBuilder:
 
     @classmethod
     def _skills_table(cls, doc, skills):
-        """Two-column borderless table of skill categories."""
+        """ATS-safe paragraph layout: bold label then comma-separated items."""
         ordered = ALWAYS_SHOW_SKILLS + CONDITIONAL_SKILLS
         rows = [(SKILL_LABELS[key], skills[key])
                 for key in ordered
                 if skills.get(key)]
         if not rows:
             return
-        table = doc.add_table(rows=len(rows), cols=2)
-        table.autofit = False
-        cls._clear_table_borders(table)
-        tblPr = table._tbl.tblPr
-        layout = OxmlElement("w:tblLayout")
-        layout.set(qn("w:type"), "fixed")
-        tblPr.append(layout)
-
-        left_w = 3.5
-        right_w = PAGE_W_CM - 2 * MARGIN_CM - left_w
-        for row_i, (label, values) in enumerate(rows):
-            left = table.cell(row_i, 0)
-            right = table.cell(row_i, 1)
-            cls._set_cell_width(left, left_w)
-            cls._set_cell_width(right, right_w)
-            lp = left.paragraphs[0]
-            lp.paragraph_format.space_before = Pt(1)
-            lp.paragraph_format.space_after = Pt(1)
-            cls._add_run(lp, f"{label}:", bold=True, size=10.5)
-            rp = right.paragraphs[0]
-            rp.paragraph_format.space_before = Pt(1)
-            rp.paragraph_format.space_after = Pt(1)
-            cls._add_run(rp, ", ".join(values), size=10.5)
+        for label, values in rows:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(6)
+            cls._add_run(p, f"{label}: ", bold=True, size=10.5)
+            cls._add_run(p, ", ".join(values), size=10.5)
 
     @staticmethod
     def _remove_compat_mode(doc):
