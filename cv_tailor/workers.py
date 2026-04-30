@@ -16,7 +16,8 @@ from .extract import extract_text_from_file
 from .profile import (ProfileManager, compress_profile, validate_cv_output)
 from .prompts import UNIFIED_SYSTEM
 from .tracker import find_existing_application, write_tracker_row
-from .utils import build_output_path, parse_json_response, strip_hard_gap
+from .utils import (build_output_path, parse_json_response, save_jd_file,
+                    strip_hard_gap)
 
 
 class UnifiedWorker(QThread):
@@ -200,9 +201,13 @@ class BulkRunner(QThread):
                           "Strengths": "", "Gaps": "", "Hard Gaps": "",
                           "Status": "", "Gap Note": "", "Filename": "",
                           "Date": datetime.now().strftime("%Y-%m-%d")}
+            # Reserve a docx path up-front so we can pair a JD .txt with it
+            # even if generation later fails (bulk: save JD for every job).
+            planned_path = build_output_path(self.output, company, title)
             self.row_update.emit(i, "Status", "Assessing & drafting")
             fit, cv, hard_gap = self._unified(company, title, jd)
             if fit is None:
+                self._save_jd_safe(planned_path, company, title, jd, None)
                 self.row_update.emit(i, "Status", "✗ Error")
                 row_result["Status"] = "Error"
                 self.results.append(row_result)
@@ -228,10 +233,12 @@ class BulkRunner(QThread):
                     i, fit.get("summary", ""), fit.get("hard_gaps", []))
                 self._decision_event.wait()
                 if self._stop:
+                    self._save_jd_safe(planned_path, company, title, jd, fit)
                     row_result["Status"] = "Skipped"
                     self.results.append(row_result)
                     break
                 if self._decision != "generate":
+                    self._save_jd_safe(planned_path, company, title, jd, fit)
                     self.row_update.emit(i, "Status", "✗ Skipped")
                     row_result["Status"] = "Skipped"
                     self.results.append(row_result)
@@ -239,19 +246,29 @@ class BulkRunner(QThread):
                     continue
 
             self.row_update.emit(i, "Status", "Writing DOCX")
+            jd_filename = ""
             try:
-                path = build_output_path(self.output, company, title)
-                DocxBuilder.build(self.profile, cv or {}, path)
+                DocxBuilder.build(self.profile, cv or {}, planned_path)
+                jd_path = self._save_jd_safe(planned_path, company, title,
+                                             jd, fit)
+                if jd_path:
+                    jd_filename = os.path.relpath(
+                        jd_path, self.output).replace(os.sep, "/")
+                else:
+                    jd_filename = ""
                 self.row_update.emit(i, "Status", "✓ Done")
-                self.row_update.emit(i, "Filename", os.path.basename(path))
+                self.row_update.emit(i, "Filename",
+                                     os.path.basename(planned_path))
                 row_result["Status"] = "Done"
-                row_result["Filename"] = os.path.basename(path)
+                row_result["Filename"] = os.path.basename(planned_path)
                 if hard_gap:
                     self.row_update.emit(i, "Gap", f"⚠ {hard_gap}")
                     row_result["Gap Note"] = hard_gap
                 self._record_to_tracker(i, company, title, fit, hard_gap,
-                                        os.path.basename(path))
+                                        os.path.basename(planned_path),
+                                        jd_filename)
             except Exception as e:
+                self._save_jd_safe(planned_path, company, title, jd, fit)
                 self.row_update.emit(i, "Status", f"✗ Error: {e}")
                 row_result["Status"] = f"Error: {e}"
             self.results.append(row_result)
@@ -260,7 +277,19 @@ class BulkRunner(QThread):
         print_session_summary()
         self.done.emit()
 
-    def _record_to_tracker(self, row, company, title, fit, hard_gap, fname):
+    def _save_jd_safe(self, docx_path, company, title, jd_text, fit):
+        """Persist JD .txt next to docx_path; swallow errors. Returns path."""
+        try:
+            fit_label = (fit or {}).get("fit", "") if fit else ""
+            fit_score = (fit or {}).get("score", "") if fit else ""
+            return save_jd_file(docx_path, company, title, jd_text,
+                                fit_label=fit_label, fit_score=fit_score)
+        except Exception as e:
+            print(f"[jd] write failed: {e}")
+            return None
+
+    def _record_to_tracker(self, row, company, title, fit, hard_gap, fname,
+                           jd_filename=""):
         """Append a row to job_applications.xlsx, prompting on duplicates."""
         try:
             existing = find_existing_application(self.output, company, title)
@@ -280,6 +309,7 @@ class BulkRunner(QThread):
                 "fit_summary": (fit or {}).get("summary", ""),
                 "hard_gap": hard_gap or "",
                 "cv_filename": fname,
+                "jd_filename": jd_filename or "",
             })
             self.tracker_updated.emit()
         except Exception as e:

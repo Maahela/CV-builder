@@ -5,8 +5,12 @@ import re
 import subprocess
 import sys
 import unicodedata
+from datetime import datetime
 
 from .constants import COMPANY_MAX, TITLE_MAX
+
+JD_HEADER_RULE = "─────────────────────────────────────────"
+JD_SUBFOLDER = "jds"
 
 
 def sanitize_filename_part(text, maxlen):
@@ -32,6 +36,58 @@ def build_output_path(output_folder, company, title):
         path = os.path.join(output_folder, f"{base}_{i}.docx")
         i += 1
     return path
+
+
+def jds_folder(output_folder):
+    """Return absolute path to the JDs subfolder inside output_folder."""
+    return os.path.join(output_folder, JD_SUBFOLDER)
+
+
+def jd_path_for_docx(docx_path):
+    """Return the JD .txt path that pairs with a given docx path.
+
+    JDs live in the `jds/` subfolder beside the docx output folder.
+    """
+    folder = os.path.dirname(docx_path)
+    name, _ = os.path.splitext(os.path.basename(docx_path))
+    return os.path.join(folder, JD_SUBFOLDER, f"{name}_JD.txt")
+
+
+def _normalize_fit_label(fit):
+    """Map free-form fit indicator to canonical Green/Yellow/Red."""
+    if not fit:
+        return ""
+    s = str(fit).lower()
+    if "green" in s or "strong" in s:
+        return "Green"
+    if "yellow" in s or "partial" in s:
+        return "Yellow"
+    if "red" in s or "poor" in s:
+        return "Red"
+    return ""
+
+
+def save_jd_file(docx_path, company, role, jd_text,
+                 fit_label="", fit_score="", date_str=None):
+    """Write the JD text file beside the docx with header. Returns path."""
+    jd_path = jd_path_for_docx(docx_path)
+    os.makedirs(os.path.dirname(jd_path) or ".", exist_ok=True)
+    canonical = _normalize_fit_label(fit_label)
+    score_part = f" (Score: {fit_score}/100)" if fit_score not in ("", None) else ""
+    fit_line = f"{canonical or '-'}{score_part}"
+    date_line = date_str or datetime.now().strftime("%Y-%m-%d")
+    header = (
+        f"{JD_HEADER_RULE}\n"
+        f"Company:  {company or ''}\n"
+        f"Role:     {role or ''}\n"
+        f"Date:     {date_line}\n"
+        f"Fit:      {fit_line}\n"
+        f"{JD_HEADER_RULE}\n"
+    )
+    with open(jd_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write(jd_text or "")
+    return jd_path
 
 
 def strip_hard_gap(text):

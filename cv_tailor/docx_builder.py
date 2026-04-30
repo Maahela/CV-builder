@@ -401,6 +401,12 @@ class DocxBuilder:
                     p.paragraph_format.space_after = Pt(4)
                     cls._add_run(p, details, size=10, color="444444")
 
+        ref_p = doc.add_paragraph()
+        ref_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        ref_p.paragraph_format.space_before = Pt(12)
+        cls._add_run(ref_p, "References available upon request.",
+                     italic=True, size=10, color="888888")
+
         doc.save(output_path)
 
     @staticmethod

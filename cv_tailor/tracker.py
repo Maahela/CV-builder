@@ -13,13 +13,13 @@ TRACKER_FILENAME = "job_applications.xlsx"
 
 HEADERS = [
     "#", "Date Applied", "Company", "Role", "Fit", "Fit Score",
-    "Fit Summary", "Hard Gap", "CV Filename", "Status",
+    "Fit Summary", "Hard Gap", "CV Filename", "JD File", "Status",
     "Interview Date", "Notes", "Follow-up Due",
 ]
 
 COL_WIDTHS = {
     "A": 5, "B": 14, "C": 22, "D": 30, "E": 10, "F": 10, "G": 35,
-    "H": 30, "I": 40, "J": 18, "K": 14, "L": 30, "M": 14,
+    "H": 30, "I": 40, "J": 40, "K": 18, "L": 14, "M": 30, "N": 14,
 }
 
 STATUS_OPTIONS = [
@@ -96,10 +96,10 @@ def _create_workbook(path):
 
 
 def _attach_status_validation(ws):
-    """Attach the Status dropdown to column J for many rows."""
+    """Attach the Status dropdown to column K for many rows."""
     formula = '"' + ",".join(STATUS_OPTIONS) + '"'
     dv = DataValidation(type="list", formula1=formula, allow_blank=True)
-    dv.add("J2:J1048576")
+    dv.add("K2:K1048576")
     ws.add_data_validation(dv)
 
 
@@ -158,7 +158,7 @@ def write_tracker_row(output_folder, row_data):
     """Append a single row to the job application tracker.
 
     row_data keys: company, role, fit, fit_score, fit_summary, hard_gap,
-    cv_filename. Date is generated here.
+    cv_filename, jd_filename. Date is generated here.
     """
     os.makedirs(output_folder, exist_ok=True)
     path = get_tracker_path(output_folder)
@@ -179,6 +179,7 @@ def write_tracker_row(output_folder, row_data):
             row_data.get("fit_summary", ""),
             row_data.get("hard_gap", ""),
             row_data.get("cv_filename", ""),
+            row_data.get("jd_filename", ""),
             "", "", "", "",
         ]
         for col_idx, val in enumerate(values, start=1):
